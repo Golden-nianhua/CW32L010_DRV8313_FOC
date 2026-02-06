@@ -1,0 +1,8 @@
+//
+// Created by Golde on 2025/12/22.
+//
+
+#ifndef CW32L010_DRV8313_FOC_INA240_H
+#define CW32L010_DRV8313_FOC_INA240_H
+
+#endif //CW32L010_DRV8313_FOC_INA240_H

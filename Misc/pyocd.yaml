@@ -1,0 +1,3 @@
+target_override: CW32L010F8
+pack: Misc/WHXY.CW32L010_DFP.1.0.0.pack
+frequency: 10000000

@@ -1,0 +1,78 @@
+# CLion and JetBrains
+.idea/
+*.iml
+
+# Build directories
+build/
+cmake-build-*/
+Debug/
+Release/
+Output/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Ninja
+build.ninja
+rules.ninja
+
+# Build outputs / binaries
+*.o
+*.obj
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.lst
+*.out
+
+# Linker scripts and maps generated files
+#*.ld
+
+# Dependencies / packages
+.vscode/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Coverage
+coverage/
+
+# Python envs (if used for scripts)
+venv/
+.env
+
+# Backup files
+*.bak
+*.orig
+
+# Certificates/keys (safety)
+*.pem
+*.key
+
+# Other common IDE/editor files
+*.sublime-workspace
+*.sublime-project
+
+# Ignore documentation build outputs
+_doc/
+
+# Keep any user-specific config out
+local_settings.json
+
+# If you have any tool-generated files you want to ignore, add them here
+# e.g. .pio, .vscode/tasks.json, etc.
+
