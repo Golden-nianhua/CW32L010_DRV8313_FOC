@@ -1,0 +1,5 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="@CLION_RUN_NAME@" type="CMakeRunConfiguration" factoryName="Application" PROGRAM_PARAMS="--build &quot;$CMakeCurrentBuildDir$&quot; --target @CLION_BUILD_TARGET@" WORKING_DIR="file://$ProjectFileDir$" PASS_PARENT_ENVS_2="true" PROJECT_NAME="@PROJECT_NAME@" TARGET_NAME="@CLION_BUILD_TARGET@" CONFIG_NAME="CW32L010-Debug" RUN_PATH="@CMAKE_COMMAND@">
+    <method v="2" />
+  </configuration>
+</component>

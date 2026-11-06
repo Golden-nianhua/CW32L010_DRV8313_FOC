@@ -1,8 +1,0 @@
-//
-// Created by Golde on 2025/12/22.
-//
-
-#ifndef CW32L010_DRV8313_FOC_KEY_H
-#define CW32L010_DRV8313_FOC_KEY_H
-
-#endif //CW32L010_DRV8313_FOC_KEY_H

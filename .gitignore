@@ -54,6 +54,7 @@ coverage/
 # Python envs (if used for scripts)
 venv/
 .env
+__pycache__/
 
 # Backup files
 *.bak

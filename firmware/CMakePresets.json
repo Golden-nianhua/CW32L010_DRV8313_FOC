@@ -1,0 +1,23 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "default",
+      "hidden": true,
+      "generator": "Ninja",
+      "toolchainFile": "${sourceDir}/cmake/arm-gcc.cmake"
+    },
+    {
+      "name": "CW32L010-Debug",
+      "inherits": "default",
+      "binaryDir": "${sourceDir}/build/Debug",
+      "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug"}
+    },
+    {
+      "name": "CW32L010-Release",
+      "inherits": "default",
+      "binaryDir": "${sourceDir}/build/Release",
+      "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+target_override: CW32L010F8
+pack: WHXY.CW32L010_DFP.1.0.0.pack
+frequency: 10000000
+connect_mode: under-reset
