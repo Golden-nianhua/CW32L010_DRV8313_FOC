@@ -261,6 +261,13 @@ def trace_metrics(path, divider):
             sample["control_source"] == source for sample in samples)
             for source in sorted({sample["control_source"] for sample in samples})},
         "injection_min_mv": min(sample["injection_mv"] for sample in samples),
+        "id_ref_min_ma": min(sample["id_ref_ma"] for sample in samples),
+        "id_ref_max_ma": max(sample["id_ref_ma"] for sample in samples),
+        "weakening_target_min_ma": min(sample["weakening_target_ma"] for sample in samples),
+        "current_reference_max_ma": max(
+            math.hypot(sample["id_ref_ma"], sample["iq_ref_ma"]) for sample in samples),
+        "current_measured_max_ma": max(
+            math.hypot(sample["id_ma"], sample["iq_ma"]) for sample in samples),
     }
     result["control_transitions"] = [
         {"time_us": sample["time_us"], "source": label(CONTROL_SOURCES, sample["control_source"]),

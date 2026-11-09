@@ -50,6 +50,8 @@ typedef struct {
     uint16_t valid_frames;
     int32_t ready_us;
     bool ready;
+    int32_t previous_drive_alpha_mv;
+    int32_t previous_drive_beta_mv;
 } SmoObserver;
 
 void Smo_ConfigDefault(SmoConfig *config);

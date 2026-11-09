@@ -21,10 +21,11 @@ static int32_t wrap_phase(int32_t value) {
     return (int32_t)((uint32_t)(value + HALF_TURN) & (TURN - 1u)) - HALF_TURN;
 }
 
-static int32_t current_step(int32_t *estimate_q8, int32_t measured_ma,
+static int32_t current_step(int32_t *estimate_q8, int32_t *previous_drive_mv, int32_t measured_ma,
                             int32_t voltage_mv, const SmoConfig *config) {
-    /* Backward Euler for L di/dt = v - R i - z. Solve the linear
-     * boundary layer implicitly, then apply the saturated sliding term. */
+    /* Solve the sliding boundary layer implicitly. The 200 us path uses
+     * trapezoidal R/L integration with the preceding voltage-minus-sliding
+     * drive. Longer periods use backward Euler. */
     /* Keep the hot path in 32-bit arithmetic on Cortex-M0+. Split the
      * current's integer/fractional parts before applying its Q16 decay.
      * Q8 voltage gain loses less than 0.2 mA at the supported 12 V input. */
@@ -33,13 +34,16 @@ static int32_t current_step(int32_t *estimate_q8, int32_t measured_ma,
     int32_t decayed = integer_current * config->decay_q16 +
                       ((fractional_current * config->decay_q16) >> 8);
     int32_t voltage_gain_q8 = config->voltage_gain_q16 >> 8;
-    int32_t prediction = (decayed + voltage_gain_q8 * voltage_mv) >> 8;
+    int32_t drive = voltage_mv;
+    if (config->sample_us == 200) drive += *previous_drive_mv;
+    int32_t prediction = (decayed + voltage_gain_q8 * drive) >> 8;
     int32_t error = prediction - measured_ma * Q8;
     error = clamp32(error, -config->sliding_boundary_q8, config->sliding_boundary_q8);
     /* Saturation before multiplication bounds this product to gain_mv*2^17,
      * within int32_t for the configured maximum gain of 12000 mV. */
     int32_t correction = (config->sliding_gain_q17 * error) >> 17;
     *estimate_q8 = prediction - ((voltage_gain_q8 * correction) >> 8);
+    *previous_drive_mv = voltage_mv - correction;
     return correction;
 }
 
@@ -63,8 +67,15 @@ void Smo_ConfigDefault(SmoConfig *config) {
 
 void Smo_Prepare(SmoConfig *config) {
     int32_t l = config->inductance_uh * 1000;
+    int32_t decay_numerator = l;
+    if (config->sample_us == 200) {
+        /* Trapezoidal integration cancels the backward-Euler phase error
+         * amplified by large rotating negative Id in the fast observer. */
+        l *= 2;
+        decay_numerator = l - config->sample_us * config->resistance_mohm;
+    }
     int32_t denominator = l + config->sample_us * config->resistance_mohm;
-    config->decay_q16 = (int32_t)((int64_t)l * 65536 / denominator);
+    config->decay_q16 = (int32_t)((int64_t)decay_numerator * 65536 / denominator);
     config->voltage_gain_q16 =
         (int32_t)((int64_t)config->sample_us * 1000 * Q8 * 65536 / denominator);
     config->sliding_boundary_q8 = config->boundary_ma * Q8 +
@@ -105,10 +116,10 @@ void Smo_SetSamplePeriod(SmoObserver *observer, SmoConfig *config,
 bool Smo_Update(SmoObserver *observer, const SmoConfig *config,
                 const SmoInput *input) {
     int32_t correction_alpha = current_step(
-        &observer->current_alpha_q8, input->current_alpha_ma,
+        &observer->current_alpha_q8, &observer->previous_drive_alpha_mv, input->current_alpha_ma,
         input->voltage_alpha_mv, config);
     int32_t correction_beta = current_step(
-        &observer->current_beta_q8, input->current_beta_ma,
+        &observer->current_beta_q8, &observer->previous_drive_beta_mv, input->current_beta_ma,
         input->voltage_beta_mv, config);
 
     int32_t shift = clamp32(config->emf_filter_shift,

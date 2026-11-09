@@ -9,9 +9,10 @@ enum {
     MOTOR_CURRENT_LIMIT_MA = 500,
     MOTOR_CURRENT_MAX_MA = 2000,
     MOTOR_BUS_MV = 12000,
+    MOTOR_BUS_MIN_MV = 6000,
+    MOTOR_BUS_MAX_MV = 24000,
     /* Linear SVPWM phase-vector amplitude, Vbus / sqrt(3). */
-    MOTOR_VOLTAGE_MAX_MV = 6928,
-    MOTOR_VOLTAGE_LIMIT_MV = MOTOR_VOLTAGE_MAX_MV,
+    MOTOR_VOLTAGE_LIMIT_MV = 6928,
     MOTOR_HFI_FIELD_DEFAULT_MA = 400,
     MOTOR_HFI_FIELD_MAX_MA = 800,
     MOTOR_SPEED_LIMIT_MRAD_S = 30000,
@@ -87,12 +88,25 @@ typedef struct {
     uint8_t iq_slew_fraction;
     uint16_t injection_headroom_mv;
     int32_t hfi_acceleration_mrad_s2;
+    int32_t weakening_integral_q6;
+    uint16_t weakening_max_ma;
+    uint16_t weakening_utilization_permille;
+    uint16_t weakening_slew_ma_s;
+    uint16_t current_q_limit_ma;
+    int16_t previous_vd_mv;
+    int16_t previous_vq_mv;
+    uint16_t weakening_voltage_mv;
+    uint16_t hfi_q_limit_ma;
+    uint8_t id_slew_fraction;
+    uint16_t weakening_q_limit_ma;
 } Motion;
 
 void Motion_Init(Motion *motion);
 void Motion_Reset(Motion *motion, int32_t position, int32_t speed);
 void Motion_SetLimits(Motion *motion, int32_t current_ma, int32_t voltage_mv);
 void Motion_SetHfiFieldCurrent(Motion *motion, int32_t current_ma);
+void Motion_SetWeakening(Motion *motion, uint16_t maximum_ma,
+                         uint16_t utilization_permille, uint16_t slew_ma_s);
 void Motion_HfiStart(Motion *motion, uint16_t rotor_phase);
 /* Sensorless operation uses 200 us or 1600 us control periods. */
 void Motion_SetSamplePeriod(Motion *motion, uint16_t sample_us);

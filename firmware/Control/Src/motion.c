@@ -33,6 +33,13 @@ static int32_t magnitude(int32_t value) {
     return value < 0 ? -value : value;
 }
 
+static uint16_t hfi_current_budget(const Motion *motion) {
+    int32_t id = motion->hfi_field_target_ma;
+    if (id > motion->current_limit_ma) id = motion->current_limit_ma;
+    return (uint16_t)FOC_Sqrt(
+        (uint32_t)(motion->current_limit_ma * motion->current_limit_ma - id * id));
+}
+
 /* Exact division in the usual PI range with 32-bit reciprocal multiplication.
  * Keep software division for large products allowed by runtime gain settings. */
 __attribute__((noinline)) static int32_t per_thousand(int32_t value) {
@@ -148,6 +155,9 @@ void Motion_Init(Motion *motion) {
         .sensorless_speed = {.kp = 5, .ki = 20},
         .sample_ticks = HFI_FRAME_TICKS,
         .hfi_acceleration_mrad_s2 = MOTOR_HFI_ACCEL_MRAD_S2,
+        .weakening_max_ma = 1000,
+        .weakening_utilization_permille = 950,
+        .weakening_slew_ma_s = 1000,
     };
     Motion_Reset(motion, 0, 0);
 }
@@ -155,10 +165,22 @@ void Motion_Init(Motion *motion) {
 void Motion_SetLimits(Motion *motion, int32_t current_ma, int32_t voltage_mv) {
     motion->current_limit_ma = current_ma;
     motion->voltage_limit_mv = voltage_mv;
+    motion->current_q_limit_ma = (uint16_t)current_ma;
+    motion->weakening_q_limit_ma = (uint16_t)current_ma;
+    motion->hfi_q_limit_ma = hfi_current_budget(motion);
+    motion->id_slew_fraction = 0;
 }
 
 void Motion_SetHfiFieldCurrent(Motion *motion, int32_t current_ma) {
     motion->hfi_field_target_ma = current_ma;
+    motion->hfi_q_limit_ma = hfi_current_budget(motion);
+}
+
+void Motion_SetWeakening(Motion *motion, uint16_t maximum_ma,
+                         uint16_t utilization_permille, uint16_t slew_ma_s) {
+    motion->weakening_max_ma = maximum_ma;
+    motion->weakening_utilization_permille = utilization_permille;
+    motion->weakening_slew_ma_s = slew_ma_s;
 }
 
 void Motion_Reset(Motion *motion, int32_t position, int32_t speed) {
@@ -186,6 +208,13 @@ void Motion_Reset(Motion *motion, int32_t position, int32_t speed) {
     motion->sample_ticks = HFI_FRAME_TICKS;
     motion->iq_slew_fraction = 0;
     motion->injection_headroom_mv = 0;
+    motion->weakening_integral_q6 = 0;
+    motion->current_q_limit_ma = (uint16_t)motion->current_limit_ma;
+    motion->weakening_q_limit_ma = (uint16_t)motion->current_limit_ma;
+    motion->previous_vd_mv = motion->previous_vq_mv = 0;
+    motion->weakening_voltage_mv = 0;
+    motion->hfi_q_limit_ma = hfi_current_budget(motion);
+    motion->id_slew_fraction = 0;
 }
 
 static void update_outer(Motion *motion, int32_t position, int32_t speed) {
@@ -265,6 +294,7 @@ void Motion_SetSamplePeriod(Motion *motion, uint16_t sample_us) {
     motion->sample_ticks = (uint8_t)(sample_us / 200u);
     motion->hfi_speed_divider = 0;
     motion->iq_slew_fraction = 0;
+    motion->id_slew_fraction = 0;
 }
 
 void Motion_SetSensorless(Motion *motion, bool regulate, uint16_t blend_q8) {
@@ -279,6 +309,33 @@ void Motion_SetSensorless(Motion *motion, bool regulate, uint16_t blend_q8) {
     motion->sensorless_blend_q8 = blend_q8 > 256 ? 256 : blend_q8;
 }
 
+static void weakening_step(Motion *motion, int32_t speed) {
+    bool active = motion->sensorless_regulate && motion->sensorless_blend_q8 == 256 &&
+        motion->sample_ticks == 1 && magnitude(speed) >= 200000 &&
+        motion->weakening_max_ma != 0;
+    if (!active && motion->weakening_integral_q6 == 0) {
+        motion->weakening_voltage_mv = 0;
+        return;
+    }
+    int32_t vd = motion->previous_vd_mv, vq = motion->previous_vq_mv;
+    int32_t voltage = (int32_t)FOC_Sqrt((uint32_t)(vd * vd + vq * vq));
+    motion->weakening_voltage_mv = (uint16_t)voltage;
+    int32_t desired = 0;
+    if (active) {
+        int32_t target_mv = per_thousand(
+            motion->voltage_limit_mv * motion->weakening_utilization_permille);
+        int32_t maximum_ma = motion->weakening_max_ma;
+        if (maximum_ma > motion->current_limit_ma) maximum_ma = motion->current_limit_ma;
+        /* The voltage loop runs every 8 ms. Its integral is mA in Q6,
+         * so a 64 mV excess changes the negative Id target by 1 mA. */
+        desired = clamp(motion->weakening_integral_q6 + target_mv - voltage,
+                         -maximum_ma * 64, 0);
+    }
+    int32_t step = per_thousand(motion->weakening_slew_ma_s * (8 * 64));
+    motion->weakening_integral_q6 += clamp(
+        desired - motion->weakening_integral_q6, -step, 2 * step);
+}
+
 Dq Motion_Step(Motion *motion, int32_t position, int32_t speed, Dq current) {
     int32_t voltage_limit = motion->voltage_limit_mv - motion->injection_headroom_mv;
     if (motion->request.mode == MOTOR_VOLTAGE) {
@@ -290,27 +347,54 @@ Dq Motion_Step(Motion *motion, int32_t position, int32_t speed, Dq current) {
     } else if (motion->request.mode == MOTOR_HFI) {
         int32_t handover = motion->sensorless_blend_q8;
         /* Establish observer angle control before withdrawing the startup field. */
-        int32_t field_target = handover == 256 ? 0 : motion->hfi_field_target_ma;
-        motion->hfi_field_ma += clamp(field_target - motion->hfi_field_ma, -1, 4);
-        if (motion->sensorless_regulate) {
-            unsigned speed_frames = motion->sample_ticks == 1 ? 40u : 5u;
-            if (++motion->hfi_speed_divider >= speed_frames) {
-                motion->hfi_speed_divider = 0;
+        int32_t field_target = handover == 256 ? motion->weakening_integral_q6 / 64
+                                              : motion->hfi_field_target_ma;
+        field_target = clamp(field_target, -motion->current_limit_ma, motion->current_limit_ma);
+        int32_t previous_d = motion->hfi_field_ma;
+        unsigned speed_frames = motion->sample_ticks == 1 ? 40u : 5u;
+        if (motion->hfi_speed_divider == 0 ||
+            motion->hfi_speed_divider == speed_frames / 2u) {
+            /* Reserve Id movement after each outer-loop phase. Keep the
+             * voltage, current-budget and speed calculations on separate
+             * frames. On release reserve the larger actual negative Id. */
+            int32_t reserved_d = field_target < previous_d ? field_target : previous_d;
+            motion->weakening_q_limit_ma = reserved_d < 0 ? (uint16_t)FOC_SqrtLowerBound(
+                (uint32_t)(motion->current_limit_ma * motion->current_limit_ma -
+                           reserved_d * reserved_d)) : (uint16_t)motion->current_limit_ma;
+        }
+        int32_t down_step = 1;
+        if (previous_d > 0 && field_target <= 0) {
+            unsigned ticks = motion->id_slew_fraction + motion->sample_ticks;
+            down_step = (int32_t)(ticks / HFI_FRAME_TICKS);
+            motion->id_slew_fraction = (uint8_t)(ticks & (HFI_FRAME_TICKS - 1u));
+        }
+        motion->hfi_field_ma += clamp(field_target - motion->hfi_field_ma, -down_step, 4);
+        if (motion->hfi_field_ma >= 0) {
+            motion->current_q_limit_ma = motion->hfi_field_ma == 0 && field_target == 0
+                ? (uint16_t)motion->current_limit_ma : motion->hfi_q_limit_ma;
+        } else {
+            motion->current_q_limit_ma = motion->weakening_q_limit_ma;
+        }
+        if (motion->hfi_speed_divider == speed_frames / 2u - 1u) {
+            weakening_step(motion, speed);
+        }
+        if (++motion->hfi_speed_divider >= speed_frames) {
+            motion->hfi_speed_divider = 0;
+            if (motion->sensorless_regulate) {
                 int32_t speed_error = motion->profile_velocity - speed;
                 bool voltage_limited =
                     (motion->voltage_saturation > 0 && speed_error > 0) ||
                     (motion->voltage_saturation < 0 && speed_error < 0);
                 motion->hfi_iq_target = pi_step(
                     &motion->sensorless_speed, speed_error,
-                    motion->current_limit_ma, voltage_limited ? 0 : 40, 0);
+                    motion->current_q_limit_ma, voltage_limited ? 0 : 40, 0);
             }
-        } else {
-            motion->hfi_speed_divider = 0;
         }
         unsigned slew_ticks = motion->iq_slew_fraction + motion->sample_ticks;
         int32_t slew = (int32_t)(slew_ticks / 2u);
         motion->iq_slew_fraction = (uint8_t)(slew_ticks & 1u);
         motion->iq_ref += clamp(motion->hfi_iq_target - motion->iq_ref, -slew, slew);
+        motion->iq_ref = clamp(motion->iq_ref, -motion->current_q_limit_ma, motion->current_q_limit_ma);
     } else if (motion->request.mode == MOTOR_RATCHET) {
         motion->iq_ref = ratchet_current(motion, position, speed);
     } else if (++motion->outer_count == OUTER_MS) {
@@ -327,11 +411,14 @@ Dq Motion_Step(Motion *motion, int32_t position, int32_t speed, Dq current) {
     if (motion->request.mode == MOTOR_CURRENT) {
         feedforward_mv += Q_AXIS_BACK_EMF_MV_PER_RAD_S * speed / 1000;
     }
-    int32_t q_limit = vd == 0 ? voltage_limit : (int32_t)FOC_Sqrt(
-        (uint32_t)(voltage_limit * voltage_limit - vd * vd));
+    uint32_t voltage_remaining = (uint32_t)(voltage_limit * voltage_limit - vd * vd);
+    int32_t q_limit = vd == 0 ? voltage_limit : (int32_t)(motion->request.mode == MOTOR_HFI
+        ? FOC_SqrtLowerBound(voltage_remaining) : FOC_Sqrt(voltage_remaining));
     int32_t vq = pi_step(&motion->loops[LOOP_Q], motion->iq_ref - current.q,
                          q_limit, period, feedforward_mv);
     motion->voltage_saturation = magnitude(vq) >= q_limit
         ? (vq < 0 ? -1 : 1) : 0;
+    motion->previous_vd_mv = (int16_t)vd;
+    motion->previous_vq_mv = (int16_t)vq;
     return (Dq){vd, vq};
 }

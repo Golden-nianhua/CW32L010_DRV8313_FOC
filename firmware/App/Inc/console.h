@@ -37,6 +37,11 @@ typedef struct {
     uint32_t missed_samples;
     uint32_t encoder_errors;
     uint32_t sample_us;
+    uint16_t bus_mv;
+    uint16_t voltage_limit_mv;
+    uint16_t supply_raw;
+    uint8_t bus_source;
+    uint8_t key_pressed;
 } ConsoleStatus;
 
 typedef struct {
@@ -70,6 +75,10 @@ typedef struct {
     int16_t observer_voltage_beta;
     int16_t observer_current_alpha;
     int16_t observer_current_beta;
+    int16_t id_ref;
+    uint16_t iq_limit;
+    int16_t weakening_target;
+    uint16_t voltage_magnitude;
 } ConsoleTrace;
 
 bool Console_Poll(ConsoleCommand *command);

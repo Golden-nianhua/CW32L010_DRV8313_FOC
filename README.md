@@ -96,6 +96,8 @@ uv run --script tools/host/foc.py shell
 | `ratchet 24 0.10 --damping 0.008` | 双向棘轮，每圈 24 格，峰值 Iq 0.10 A（可设至 0.50 A），附加阻尼 0.008 A/(rad/s) |
 | `hfi 1.5` | HFI 辅助的无感运行，指令速度范围 ±1000 rad/s |
 | `hfi-ramp 100` | 无感加减速斜率 100 rad/s²，可运行时修改，范围 5～1000 rad/s² |
+| `bus-voltage 12` | 停机设置实际母线电压，单位 V，范围 6～24 V，0 切回采样源 |
+| `fw-config 1000 950 1000` | 弱磁最大负 Id 1000 mA、电压利用率目标 950‰、负 Id 目标变化率上限 1000 mA/s，可运行时修改 |
 | `gain q 0.5 30` | 调整 q 轴 PI，停机时生效，重启恢复默认值 |
 | `gain sensorless-speed 0.005 0.020` | 调整 HFI/SMO 无感速度 PI，停机时生效，重启恢复此默认值 |
 | `watch --csv` | 连续输出状态或 CSV，Ctrl+C 结束读取 |
@@ -103,7 +105,7 @@ uv run --script tools/host/foc.py shell
 
 支持在 PowerShell 直接执行子命令，例如 `uv run --script tools/host/foc.py status`。上电默认关闭驱动，只有 `enable` 会进入连续控制。PA3 按键和 `stop` 主动停机。编码器读失败或 ADC 暂无新样本时保留上一次输出，下一组有效样本恢复更新。采样丢拍、超时和电流偏高会显示在诊断字段中。电压、电流和有感速度命令默认范围分别为 ±6.928 V、±500 mA、±30 rad/s。电流上限用于 Iq 目标，电压模式直接输出 Vq。
 
-HFI 注入和运行限值可在停机的 `ready` 或 `unaligned` 状态下修改。`hfi-config` 的三个参数依次为注入电压 mV、Id 励磁电流 mA、瞬时相电流过流阈值 mA。`limits` 的两个参数依次为 Iq 电流上限 mA 和输出电压矢量幅值上限 mV。Iq 可调上限为 2000 mA，HFI 默认瞬时过流阈值为 2000 mA。12 V 母线采用线性 SVPWM，电压矢量默认上限为 6928 mV。d/q 电压采用圆形限幅，连续 HFI 期间按剩余注入幅值预留裕量。设置仅保存在 RAM，复位后 Iq 上限恢复默认的 500 mA，电压上限恢复 6928 mV，加速度恢复 100 rad/s²。
+HFI 注入和运行限值可在停机的 `ready` 或 `unaligned` 状态下修改。`hfi-config` 的三个参数依次为注入电压 mV、Id 励磁电流 mA、瞬时相电流过流阈值 mA。`limits` 的两个参数依次为电流矢量上限 mA 和输出电压矢量幅值上限 mV，无感模式按 Id 分配剩余 Iq 预算。电流可调上限为 2000 mA，HFI 默认瞬时过流阈值为 2000 mA。12 V 母线采用线性 SVPWM，电压矢量默认上限为 6928 mV。d/q 电压采用圆形限幅，连续 HFI 期间按剩余注入幅值预留裕量。设置仅保存在 RAM，复位后电流上限恢复默认的 500 mA，电压上限恢复 6928 mV，加速度恢复 100 rad/s²。
 
 ```powershell
 uv run --script tools/host/foc.py hfi-config 200 400 2000
@@ -125,11 +127,31 @@ hfi 30
 enable
 ```
 
-`hfi 30` 的数值是机械 rad/s，命令范围为 ±1000 rad/s。使能时先测电流零点并两段对齐，电机轴会移动少许。锁定后旋转场默认按 100 rad/s² 的斜坡跟随目标速度，满足反电动势条件后自动交给 SMO，`status` 或 `watch` 中的 `source` 依次显示 `hfi`、`to_smo`、`smo`。625 Hz 启动阶段参考速度最高为 100 rad/s，进入 5 kHz 路径后继续跟随更高目标。SMO 完成交接并退出启动励磁后，参考速度达到 40 rad/s 可转入 5 kHz 的独立观测／电流环，诊断输出仍为 500 Hz。快路径在估速降至 20 rad/s 时退出，回到 HFI 的判断继续使用反电动势条件。运行中输入 `hfi-ramp 200` 可把加减速斜率调至 200 rad/s²，停机后保留，复位恢复默认值。
+`hfi 30` 的数值是机械 rad/s，命令范围为 ±1000 rad/s。使能时先测电流零点并两段对齐，电机轴会移动少许。锁定后旋转场默认按 100 rad/s² 的斜坡跟随目标速度，满足反电动势条件后自动交给 SMO，`status` 或 `watch` 中的 `source` 依次显示 `hfi`、`to_smo`、`smo`。625 Hz 启动阶段参考速度最高为 100 rad/s，进入 5 kHz 路径后继续跟随更高目标。SMO 完成交接、参考速度达到 40 rad/s 且估速达到 30 rad/s 后，退出启动正 Id 再转入 5 kHz 独立观测／电流环，参考达到 100 rad/s 时允许提前切入快环。启动正 Id 按 625 mA/s 退出，诊断输出仍为 500 Hz。快路径在估速降至 20 rad/s 时退出，回到 HFI 的判断继续使用反电动势条件。运行中输入 `hfi-ramp 200` 可把加减速斜率调至 200 rad/s²，停机后保留，复位恢复默认值。
+
+`rpm = rad/s × 60 / (2π)`。363 rad/s 约为 3466 rpm，400 rad/s 约为 3820 rpm，数值对应电机轴的机械转速。CLI 的 `status` 和 `watch` 同时显示 rad/s 与 rpm。无感状态中的速度由观测器估算，受控 trace 另外用 MT6701 原始角度核对实际转速。
+
+高速快 SMO 完成交接且估速达到 200 rad/s 后，弱磁环每 8 ms 按电压裕量调整负 Id。默认参数为 `fw-config 1000 950 1000`，`fw-config 0 950 1000` 平滑退出弱磁。启动正 Id 与弱磁负 Id 共用实际 d 轴参考，Iq 预算按 `sqrt(Imax² − Id²)` 分配，2 A 设置限制总电流矢量。参数保存在 RAM，复位恢复默认值。
 
 运行中输入 `hfi -30` 时先由 SMO 制动减速，到低速再续接 HFI、平滑过零，随后重新交给反向 SMO。`hfi 0` 减速至位置保持，`stop` 关闭驱动和注入。MT6701 记录实测位置供对照。`watch` 用 Ctrl+C 结束显示，停机使用 `stop`。
 
-高转速运行受反电动势与母线电压影响，可在停机后用 `limits 2000 6928` 设置 2 A Iq 上限并使用完整线性 SVPWM 电压范围。按当前 19 mV/(rad/s) 参数，300 rad/s 对应约 5.7 V 反电动势，还需电阻与电感压降。±1000 rad/s 是命令范围，实际可达速度取决于电机参数、母线和负载。2026-11-06 实机已验证 ±60 rad/s 反转及 300 rad/s 稳态，400 rad/s 指令下实测约 363 rad/s，电压矢量达到 6.928 V 限幅。对应采集中控制、诊断、编码器及 RTT 均无新增丢失或错误。采样率、交接与实机范围见[滑模观测器](docs/firmware/smo.md)。
+高转速运行受反电动势与母线电压影响，可在停机后用 `limits 2000 6928` 设置 2 A 电流矢量上限并使用完整线性 SVPWM 电压范围。按当前 19 mV/(rad/s) 参数，300 rad/s 对应约 5.7 V 反电动势，还需电阻与电感压降。±1000 rad/s 是命令范围，实际可达速度取决于电机参数、母线和负载。2026-11-06 的已提交基线验证了 ±60 rad/s 反转及 ±300 rad/s 稳态，400 rad/s 指令下实测约 363 rad/s。弱磁修改期间的候选固件已测到约 400 rad/s 跟踪，以及 450 rad/s 指令下约 428 rad/s。最新离线修订保留在工作区，等待实机复测后决定提交。采样率、交接与各版实测范围见[滑模观测器](docs/firmware/smo.md)。
+
+## 母线电压
+
+停机后输入实际供电电压，PWM 归一化、HFI／SMO 电压重建、可用电压上限与弱磁电压目标同步更新。`status` 显示 `bus` 配置值和 `Vlimit` 当前有效上限。当前默认采样源返回 12 V 占位值，`bus-voltage 12` 切换为人工配置，`bus-voltage 0` 切回采样源。状态中的 `bus_source` 区分 `stub`、`manual` 与 `adc`。
+
+```text
+stop
+bus-voltage 12
+limits 2000 0
+```
+
+`limits` 的电压参数为 0 时自动跟随 `Vbus / sqrt(3)`，默认采用该策略。非零值作为显式输出上限，切换母线后保留，并受当前可用电压约束。例如设置 5000 mV 后提高母线，输出仍限制为 5000 mV。配置保存在 RAM，复位恢复 12 V、500 mA 与自动电压上限。6～24 V 是固件参数与计算范围，具体板卡、电机的供电范围需结合硬件确定。
+
+PA3 的 ADC／KEY 流程已接入。配置位于 `firmware/BSP/Inc/bus_sense.h`，当前 `BUS_SENSE_ADC_ENABLED=0`，保留原 GPIO 按键与 12 V 占位电压。硬件接好后配置上、下分压电阻并启用该开关，PA3 使用 ADC CH3、序列 2，原两相电流顺序保持不变。上下电阻暂设 100 kΩ／10 kΩ，需按实际电阻修改。
+
+真实采样下，PA3 接近 0 V 连续两次判定 KEY 按下，按下期间保持上一次母线估计；释放采用迟滞。主循环消费 ADC 原始值、滤波并通过 `set_bus_voltage()` 更新调制、电压重建和限幅。状态另发送 `supply_raw` 与 `key_pressed`。
 
 ## RTT 遥测
 
@@ -139,4 +161,4 @@ enable
 uv tool run --python 3.12 --managed-python --from pyocd==0.46.0 pyocd rtt --project tools/pyocd --connect attach --address 0x20000000 --size 0x1000 --log-file telemetry.bin
 ```
 
-上行通道 0 输出 60 字节整数遥测帧，由上位机解码。下行位置命令为 `@P,<目标角度>;`，单位 mrad。例如 `@P,1571;` 对应 1.571 rad。上行空间不足时整帧丢弃。帧格式与接线见[硬件接口](docs/hardware/hardware-interfaces.md#swd-与-rtt)。
+上行通道 0 输出 68 字节整数遥测帧，由上位机解码。下行位置命令为 `@P,<目标角度>;`，单位 mrad。例如 `@P,1571;` 对应 1.571 rad。上行空间不足时整帧丢弃。帧格式与接线见[硬件接口](docs/hardware/hardware-interfaces.md#swd-与-rtt)。

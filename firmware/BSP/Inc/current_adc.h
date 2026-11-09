@@ -28,6 +28,9 @@ typedef struct {
 } CurrentHfiFrame;
 
 void CurrentAdc_Init(void);
+uint16_t CurrentAdc_SupplyRaw(void);
+/* Main-context supply update for duty-to-voltage reconstruction. */
+void CurrentAdc_SetBusVoltage(uint16_t bus_mv);
 /* Consume the oldest retained sample. Sequence gaps expose queue overflow. */
 uint32_t CurrentAdc_Next(uint16_t *raw_b, uint16_t *raw_c, uint32_t *time_us);
 void CurrentAdc_StartPulse(uint16_t duty[CURRENT_PULSE_VECTORS + 1][3], uint8_t periods,

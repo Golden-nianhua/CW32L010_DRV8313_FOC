@@ -1,4 +1,5 @@
 #include "current_adc.h"
+#include "bus_sense.h"
 
 #include <string.h>
 #include "drv8313.h"
@@ -6,6 +7,22 @@
 #include "cw32l010_adc.h"
 #include "cw32l010_gpio.h"
 #include "cw32l010_sysctrl.h"
+
+static volatile uint16_t supply_raw;
+
+uint16_t CurrentAdc_SupplyRaw(void) { return supply_raw; }
+
+static uint32_t voltage_scale_q15 = 32768;
+
+void CurrentAdc_SetBusVoltage(uint16_t bus_mv) {
+    voltage_scale_q15 = ((uint32_t)bus_mv * 32768u + 6000u) / 12000u;
+}
+
+static void scale_frame_voltage(CurrentHfiFrame *frame) {
+    if (voltage_scale_q15 == 32768u) return;
+    frame->voltage_alpha_mv = frame->voltage_alpha_mv * (int32_t)voltage_scale_q15 >> 15;
+    frame->voltage_beta_mv = frame->voltage_beta_mv * (int32_t)voltage_scale_q15 >> 15;
+}
 
 static volatile uint32_t sequence;
 typedef struct {
@@ -269,9 +286,10 @@ bool CurrentAdc_ReadHfi(CurrentHfiFrame *frame) {
         memset(frame->delta, 0, sizeof(frame->delta));
         frame->raw_b = (uint16_t)((int32_t)pulse.zero_b + snapshot.sum[0][0] / 4);
         frame->raw_c = (uint16_t)((int32_t)pulse.zero_c + snapshot.sum[0][1] / 4);
-        /* Four 20 kHz PWM samples, 1200 timer counts, 12 V bus. */
+        /* Four 20 kHz samples at a 12 V reference; scale to the configured bus below. */
         frame->voltage_alpha_mv = snapshot.voltage_sum[0] * 5 / 6;
         frame->voltage_beta_mv = snapshot.voltage_sum[1] * 94593 >> 16;
+        scale_frame_voltage(frame);
         return true;
     }
     frame->sample_us = CURRENT_HFI_SAMPLE_US;
@@ -291,9 +309,10 @@ bool CurrentAdc_ReadHfi(CurrentHfiFrame *frame) {
     }
     frame->raw_b = (uint16_t)((int32_t)pulse.zero_b + response_divide(current_sum[0], 152, 1725));
     frame->raw_c = (uint16_t)((int32_t)pulse.zero_c + response_divide(current_sum[1], 152, 1725));
-    /* Four base-voltage snapshots in Q8 timer counts, converted at 12 V. */
+    /* Four Q8 snapshots converted at the 12 V reference, then supply-scaled. */
     frame->voltage_alpha_mv = snapshot.voltage_sum[0] * 2133 >> 17;
     frame->voltage_beta_mv = snapshot.voltage_sum[1] * 3695 >> 17;
+    scale_frame_voltage(frame);
     return true;
 }
 
@@ -437,6 +456,13 @@ void CurrentAdc_Init(void) {
     ADC_InitStructure.ADC_IN1.ADC_SampTime = ADC_SampTime18Clk;
     ADC_InitStructure.ADC_SQREns = ADC_SqrEns0to1;
 
+#if BUS_SENSE_ADC_ENABLED
+    __SYSCTRL_GPIOA_CLK_ENABLE();
+    PA03_ANALOG_ENABLE();
+    ADC_InitStructure.ADC_IN2.ADC_InputChannel = ADC_InputCH3;
+    ADC_InitStructure.ADC_IN2.ADC_SampTime = ADC_SampTime54Clk;
+    ADC_InitStructure.ADC_SQREns = ADC_SqrEns0to2;
+#endif
     ADC_Init(&ADC_InitStructure);
 
     ADC_ClearITPendingAll();
@@ -543,6 +569,9 @@ __attribute__((section(".RamFunc"))) void ADC_IRQHandler(void) {
             CurrentSample *sample = &samples[(sequence + 1u) & (SAMPLE_QUEUE_SIZE - 1u)];
             sample->b = (uint16_t)CW_ADC->RESULT0;
             sample->c = (uint16_t)CW_ADC->RESULT1;
+#if BUS_SENSE_ADC_ENABLED
+            supply_raw = (uint16_t)CW_ADC->RESULT2;
+#endif
             sample->time_us = BoardTime_NowUs();
             __DMB();
             ++sequence;

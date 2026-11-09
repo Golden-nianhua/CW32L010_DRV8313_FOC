@@ -1,5 +1,6 @@
 #include "board_time.h"
 #include "bsp.h"
+#include "bus_sense.h"
 #include "console.h"
 #include "current_adc.h"
 #include "drv8313.h"
@@ -12,7 +13,6 @@
 
 enum {
     ELECTRICAL_TURN = 16384,
-    BUS_MV = MOTOR_BUS_MV,
     POLE_PAIRS = 7,
     ENCODER_DIRECTION = -1,
     CURRENT_ZERO_SAMPLES = 100,
@@ -68,6 +68,7 @@ typedef struct {
     uint16_t raw_angle;
     uint16_t electrical_zero;
     uint16_t align_mv;
+    uint16_t voltage_cap_mv;
     uint16_t pulse_angle;
     uint16_t pulse_motion;
     uint16_t pending_b, pending_c;
@@ -84,10 +85,11 @@ typedef struct {
     bool hfi_pre_align;
     bool smo_enabled;
     bool encoder_pending;
+    bool bus_manual_override;
 } MotorApp;
 
 static void apply_voltage(Dq voltage, FocAngle angle) {
-    PhaseDuty duty = FOC_Modulate(voltage, angle, BUS_MV, DRV8313_PWM_MAX);
+    PhaseDuty duty = FOC_Modulate(voltage, angle, FOC_GetBusVoltage(), DRV8313_PWM_MAX);
     DRV8313_SetDuty(duty.a, duty.b, duty.c);
 }
 
@@ -109,6 +111,16 @@ static void stop(MotorApp *app) {
     Motion_Reset(&app->motion, app->status.position, app->status.speed);
     app->status.vd = 0;
     app->status.vq = 0;
+}
+
+/* Called in the main context. Future ADC supply measurements use this entry. */
+static void set_bus_voltage(MotorApp *app, uint16_t bus_mv) {
+    FOC_SetBusVoltage(bus_mv);
+    CurrentAdc_SetBusVoltage(bus_mv);
+    int32_t limit = FOC_GetVoltageLimit();
+    if (app->voltage_cap_mv != 0 && app->voltage_cap_mv < limit) limit = app->voltage_cap_mv;
+    /* Supply updates leave current budgets and current-slew state intact. */
+    app->motion.voltage_limit_mv = limit;
 }
 
 static bool in_range(int32_t value, int32_t min, int32_t max) {
@@ -153,11 +165,12 @@ static void pulse_duties(uint16_t duty[CURRENT_PULSE_VECTORS + 1][3], Dq voltage
     int32_t alpha = (voltage.d * angle.cos_q14 - voltage.q * angle.sin_q14) / 16384;
     int32_t beta = (voltage.d * angle.sin_q14 + voltage.q * angle.cos_q14) / 16384;
     /* +alpha, -alpha, +beta, -beta, base. */
+    uint16_t bus_mv = FOC_GetBusVoltage();
     for (unsigned i = 0; i <= CURRENT_PULSE_VECTORS; ++i) {
         int32_t injection = i == CURRENT_PULSE_VECTORS ? 0 : amplitude;
         if (i & 1u) injection = -injection;
         Dq stationary = {.d = alpha + (i < 2 ? injection : 0), .q = beta + (i >= 2 ? injection : 0)};
-        PhaseDuty pwm = FOC_ModulateStationary(stationary.d, stationary.q, BUS_MV,
+        PhaseDuty pwm = FOC_ModulateStationary(stationary.d, stationary.q, bus_mv,
                                                continuous ? 61440 : DRV8313_PWM_MAX);
         duty[i][0] = pwm.a;
         duty[i][1] = pwm.b;
@@ -242,7 +255,7 @@ static CommandResult command_result(MotorApp *app, const ConsoleCommand *command
     if (app->state == PROBING && command->code != 'X' && command->code != 'Q') return BAD_STATE;
     if (app->motion.request.mode == MOTOR_HFI && app->state != READY && app->state != UNALIGNED &&
         command->code != 'X' && command->code != 'Q' && command->code != 'Y' &&
-        command->code != 'A' && command->code != 'D') return BAD_STATE;
+        command->code != 'A' && command->code != 'D' && command->code != 'W') return BAD_STATE;
     const int32_t *args = command->args;
     switch (command->code) {
         case 'V': return set_mode(app, command, MOTOR_VOLTAGE);
@@ -258,6 +271,17 @@ static CommandResult command_result(MotorApp *app, const ConsoleCommand *command
             if (command->count != 1 ||
                 !in_range(args[0], 5000, MOTOR_HFI_ACCEL_MAX_MRAD_S2)) return BAD_ARGUMENT;
             app->motion.hfi_acceleration_mrad_s2 = args[0];
+            return OK;
+        case 'B':
+            if (command->count != 1 || (args[0] != 0 && !in_range(args[0], MOTOR_BUS_MIN_MV, MOTOR_BUS_MAX_MV))) return BAD_ARGUMENT;
+            if (app->state != READY && app->state != UNALIGNED) return BAD_STATE;
+            app->bus_manual_override = args[0] != 0;
+            set_bus_voltage(app, args[0] == 0 ? BSP_BusVoltage() : (uint16_t)args[0]);
+            return OK;
+        case 'W':
+            if (command->count != 3 || !in_range(args[0], 0, MOTOR_CURRENT_MAX_MA) ||
+                !in_range(args[1], 700, 990) || !in_range(args[2], 100, 10000)) return BAD_ARGUMENT;
+            Motion_SetWeakening(&app->motion, (uint16_t)args[0], (uint16_t)args[1], (uint16_t)args[2]);
             return OK;
         case 'G':
             if (command->count != 3 || !in_range(args[0], 0, LOOP_COUNT)
@@ -280,16 +304,19 @@ static CommandResult command_result(MotorApp *app, const ConsoleCommand *command
             Motion_SetHfiFieldCurrent(&app->motion, args[1]);
             CurrentAdc_SetHfiCurrentLimit((uint16_t)args[2]);
             return OK;
-        case 'L':
-            if (command->count != 2 || !in_range(args[0], 100, MOTOR_CURRENT_MAX_MA)
-                                    || !in_range(args[1], 500, MOTOR_VOLTAGE_MAX_MV)) return BAD_ARGUMENT;
+        case 'L': {
+            int32_t voltage_limit = args[1] == 0 ? FOC_GetVoltageLimit() : args[1];
+            if (command->count != 2 || !in_range(args[0], 100, MOTOR_CURRENT_MAX_MA) ||
+                !in_range(voltage_limit, 500, FOC_GetVoltageLimit())) return BAD_ARGUMENT;
             if ((app->state != READY && app->state != UNALIGNED) || BSP_StopPressed()) return BAD_STATE;
             if (app->motion.request.mode == MOTOR_CURRENT &&
-                (app->motion.request.target < -args[0] || app->motion.request.target > args[0])) return BAD_ARGUMENT;
+                !in_range(app->motion.request.target, -args[0], args[0])) return BAD_ARGUMENT;
             if (app->motion.request.mode == MOTOR_VOLTAGE &&
-                (app->motion.request.target < -args[1] || app->motion.request.target > args[1])) return BAD_ARGUMENT;
-            Motion_SetLimits(&app->motion, args[0], args[1]);
+                !in_range(app->motion.request.target, -voltage_limit, voltage_limit)) return BAD_ARGUMENT;
+            app->voltage_cap_mv = (uint16_t)args[1];
+            Motion_SetLimits(&app->motion, args[0], voltage_limit);
             return OK;
+        }
         case 'O':
             if (command->count != 2 || !in_range(args[0], 0, 11)) return BAD_ARGUMENT;
             if (app->state != READY && app->state != UNALIGNED) return BAD_STATE;
@@ -455,7 +482,7 @@ static bool update_encoder(MotorApp *app) {
     uint16_t raw;
     if (!MT6701_ReadAngle(&raw)) {
         ++app->status.encoder_errors;
-        if (app->status.event < CURRENT_HIGH) app->status.event = ENCODER_ERROR;
+        if (app->status.event < ENCODER_ERROR) app->status.event = ENCODER_ERROR;
         return false;
     }
     accept_encoder(app, raw);
@@ -586,14 +613,15 @@ static void process_hfi(MotorApp *app, uint32_t now) {
     int32_t reference_speed = app->motion.profile_velocity;
     if (reference_speed < 0) reference_speed = -reference_speed;
     bool want_fast = app->sensorless.source == CONTROL_SMO &&
-        app->motion.hfi_field_ma == 0 &&
         (fast ? absolute_speed > SMO_FAST_EXIT_MRAD_S
               : reference_speed >= SMO_FAST_ENTER_MRAD_S &&
-                absolute_speed >= SMO_FAST_ENTER_MRAD_S * 3 / 4);
+                absolute_speed >= SMO_FAST_ENTER_MRAD_S * 3 / 4 &&
+                (app->motion.hfi_field_ma <= 0 ||
+                 reference_speed >= MOTOR_HFI_START_SPEED_MRAD_S));
     if (fast != want_fast) {
         set_sensorless_period(app, want_fast, voltage, angle);
     } else if (fast) {
-        PhaseDuty duty = FOC_Modulate(voltage, angle, BUS_MV, DRV8313_PWM_MAX);
+        PhaseDuty duty = FOC_Modulate(voltage, angle, FOC_GetBusVoltage(), DRV8313_PWM_MAX);
         CurrentAdc_SetSmoDuty(duty.a, duty.b, duty.c);
     } else {
         uint16_t duty[CURRENT_PULSE_VECTORS + 1][3];
@@ -663,6 +691,11 @@ static void report(MotorApp *app) {
     app->status.control_source = app->state == RUNNING || app->state == HFI_LOCKING
         ? (app->motion.request.mode == MOTOR_HFI ? app->sensorless.source : CONTROL_ENCODER)
         : CONTROL_NONE;
+    app->status.bus_source = app->bus_manual_override ? 1 : (BUS_SENSE_ADC_ENABLED ? 2 : 0);
+    app->status.supply_raw = CurrentAdc_SupplyRaw();
+    app->status.key_pressed = BSP_StopPressed();
+    app->status.bus_mv = FOC_GetBusVoltage();
+    app->status.voltage_limit_mv = (uint16_t)app->motion.voltage_limit_mv;
     app->status.state = app->state;
     app->status.target = app->motion.request.target;
     app->status.iq_ref = app->motion.iq_ref;
@@ -730,6 +763,10 @@ static void trace_sample(MotorApp *app, uint16_t raw_b, uint16_t raw_c) {
         .observer_voltage_beta = (int16_t)app->smo_voltage_beta,
         .observer_current_alpha = hfi_active ? (int16_t)(-ib - ic) : 0,
         .observer_current_beta = hfi_active ? (int16_t)((ib - ic) * 9459 / 16384) : 0,
+        .id_ref = hfi_active ? (int16_t)app->motion.hfi_field_ma : 0,
+        .iq_limit = app->motion.current_q_limit_ma,
+        .weakening_target = (int16_t)(app->motion.weakening_integral_q6 / 64),
+        .voltage_magnitude = app->motion.weakening_voltage_mv,
     });
 }
 
@@ -738,6 +775,7 @@ int main(void) {
 
     MotorApp app = {0};
     Motion_Init(&app.motion);
+    set_bus_voltage(&app, MOTOR_BUS_MV);
     Smo_ConfigDefault(&app.smo_config);
     app.smo_config.sample_us = MOTOR_CONTROL_US;
     app.smo_config.emf_filter_shift = 1;
@@ -788,6 +826,11 @@ int main(void) {
             elapsed = conversion_time - app.sample_time;
             app.adc_sequence = sequence;
             app.sample_time = conversion_time;
+            BSP_UpdateSupply();
+            uint16_t sensed_bus = BSP_BusVoltage();
+            if (!app.bus_manual_override && sensed_bus != FOC_GetBusVoltage()) {
+                set_bus_voltage(&app, sensed_bus);
+            }
             app.status.sample_us = elapsed / gap;
             uint32_t nominal_sample_us =
                 app.motion.request.mode == MOTOR_HFI &&
@@ -798,11 +841,11 @@ int main(void) {
             }
             if (gap > 1u) {
                 app.status.missed_samples += gap - 1u;
-                if (app.status.event < CURRENT_HIGH) app.status.event = SAMPLE_GAP;
+                if (app.status.event < SAMPLE_GAP) app.status.event = SAMPLE_GAP;
             } else if (sample_transition == 0 &&
                        (elapsed < 3u * nominal_sample_us / 4u ||
                         elapsed > 5u * nominal_sample_us / 4u)) {
-                if (app.status.event < CURRENT_HIGH) app.status.event = SAMPLE_GAP;
+                if (app.status.event < SAMPLE_GAP) app.status.event = SAMPLE_GAP;
             }
             if (sample_transition != 0) --sample_transition;
             if (app.motion.request.mode == MOTOR_HFI && app.state == RUNNING &&
@@ -815,10 +858,11 @@ int main(void) {
                 process_sample(&app, raw_b, raw_c, now);
                 trace_sample(&app, raw_b, raw_c);
             }
-        } else if (elapsed > 4u * MOTOR_CONTROL_US) {
-            if (app.status.event < CURRENT_HIGH) app.status.event = SAMPLE_TIMEOUT;
+        } else if (elapsed > 4u * previous_sample_period) {
+            if (app.status.event < SAMPLE_TIMEOUT) app.status.event = SAMPLE_TIMEOUT;
             app.status.sample_us = 0;
-            if (app.motion.request.mode == MOTOR_HFI && (app.state == HFI_LOCKING || app.state == RUNNING)) stop(&app);
+            /* Diagnostic publication and I2C may lag while control frames
+             * remain valid. process_hfi owns the control-frame watchdog. */
         }
 
         if (app.encoder_pending) {
@@ -829,7 +873,7 @@ int main(void) {
                 if (result == MT6701_READY) accept_encoder(&app, raw);
                 else {
                     ++app.status.encoder_errors;
-                    if (app.status.event < CURRENT_HIGH) app.status.event = ENCODER_ERROR;
+                    if (app.status.event < ENCODER_ERROR) app.status.event = ENCODER_ERROR;
                 }
                 trace_sample(&app, app.pending_b, app.pending_c);
             }

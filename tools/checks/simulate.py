@@ -4,6 +4,7 @@ from math import atan2, cos, isqrt, pi, sin, sqrt
 from pathlib import Path
 from random import Random
 import json
+import re
 import struct
 import tempfile
 import time
@@ -117,13 +118,19 @@ def check_startup_and_modes(elf_path):
         2240: b"@Q;", 2320: b"@Q;", 2400: b"@Q;", 2480: b"@Q;", 2481: b"@H,120,501,0;",
         2482: b"@H,120,500,0;", 2491: b"@Q;", 2560: b"@Q;", 2570: b"@X;", 2575: b"@I,701;",
         2580: b"@L,700,3500;", 2585: b"@F,200,400,1000;", 2590: b"@I,650;", 2595: b"@V,3200;",
-        2605: b"@Y,1500;", 2606: b"@E;", 3900: b"@Q;", 3960: b"@X;",
+        2605: b"@Y,1500;", 2606: b"@E;", 3900: b"@Q;", 3901: b"@W,1200,950,1000;", 3902: b"@B,9000;", 3960: b"@X;",
         3961: b"@F,200,400,2000;", 3962: b"@F,200,400,2001;",
         3963: b"@L,2000,3000;", 3964: b"@I,2000;", 3965: b"@I,2001;",
         3966: b"@I,-2000;", 3967: b"@L,2001,3000;", 3968: b"@Y,1500;",
         3969: b"@Y,1000000;", 3970: b"@Y,-1000000;", 3971: b"@Y,1000001;",
         3972: b"@L,2000,6928;", 3973: b"@L,2000,6929;", 3974: b"@A,100000;",
         3975: b"@A,4999;", 3976: b"@A,1000000;", 3977: b"@A,1000001;",
+        3978: b"@W,2000,950,1000;", 3979: b"@W,2001,950,1000;",
+        3980: b"@W,1200,699,1000;", 3981: b"@W,1200,950,99;", 3982: b"@W,0,950,1000;",
+        3983: b"@B,9000;", 3984: b"@B,18000;", 3985: b"@L,2000,0;",
+        3986: b"@B,18000;", 3987: b"@V,10000;", 3988: b"@B,6000;",
+        3989: b"@V,4000;", 3990: b"@B,24001;", 3991: b"@B,5999;",
+        3992: b"@B,12000;", 3993: b"@B,0;",
     }
     expected = {
         1: (0, 0, 0), 2: (0, 0, 2), 3: (0, 1, 0), 640: (0, 3, 0),
@@ -134,12 +141,13 @@ def check_startup_and_modes(elf_path):
         2160: (6, 3, 0), 2161: (6, 4, 0), 2481: (6, 4, 1), 2482: (6, 4, 0),
         2570: (6, 3, 0), 2575: (6, 3, 1), 2580: (6, 3, 0), 2585: (6, 3, 0),
         2590: (1, 3, 0), 2595: (0, 3, 0),
-        2605: (7, 3, 0), 2606: (7, 1, 0), 3900: (7, 4, 0), 3960: (7, 3, 0),
+        2605: (7, 3, 0), 2606: (7, 1, 0), 3900: (7, 4, 0), 3901: (7, 4, 0), 3960: (7, 3, 0),
         3961: (7, 3, 0), 3962: (7, 3, 1), 3963: (7, 3, 0), 3964: (1, 3, 0),
         3965: (1, 3, 1), 3966: (1, 3, 0), 3967: (1, 3, 1), 3968: (7, 3, 0),
         3969: (7, 3, 0), 3970: (7, 3, 0), 3971: (7, 3, 1),
         3972: (7, 3, 0), 3973: (7, 3, 1), 3974: (7, 3, 0),
         3975: (7, 3, 1), 3976: (7, 3, 0), 3977: (7, 3, 1),
+        3978: (7, 3, 0), 3979: (7, 3, 1), 3980: (7, 3, 1), 3981: (7, 3, 1), 3982: (7, 3, 0),
     }
     decoder = FrameDecoder()
     tick = sequence = clock = 0
@@ -257,6 +265,14 @@ def check_startup_and_modes(elf_path):
         assert any(sample <= t <= sample + 2 and s.command == ord("Q") and s.mode == 6 and
                    s.profile_mrad == fine_origin + shift and low <= s.iq_ref_ma <= high for t, s in frames), (
                        f"fine ratchet center or torque shape at sample {sample}")
+    assert any(3902 <= t <= 3934 and s.command == ord("B") and s.result == 2 and s.bus_mv == 12000 for t, s in frames), "bus edit while running"
+    for tick_start, bus, limit in ((3983, 9000, 5196), (3984, 18000, 6928), (3986, 18000, 10392),
+                                   (3988, 6000, 3464), (3992, 12000, 6928)):
+        assert any(tick_start <= t <= tick_start + 1 and s.command == ord("B") and s.result == 0
+                   and s.bus_mv == bus and s.voltage_limit_mv == limit for t, s in frames), "bus command/limits"
+    for tick_start in (3989, 3990, 3991):
+        assert any(t == tick_start and s.result == 1 for t, s in frames), "bus voltage bounds"
+    assert any(t >= 3993 and s.bus_source == 0 and s.bus_mv == 12000 for t, s in frames), "stub supply source"
     records = list(TRACE_FORMAT.iter_unpack(trace_bytes))
     assert [r[16] for r in records] == [0, 1, 2, 3], "trace record count and indices"
     assert all(r[4:9] == (8384, 0, 0xFFFF, 2048, 2050) for r in records), "trace sensor values"
@@ -510,6 +526,22 @@ def check_sensorless_sampler(elf_path):
     assert actual == (11, *((960, -640) * 4), 2168, 1970), "HFI buffer after fast operation"
     alpha, beta, period = struct.unpack("<iiH", emu.cpu.mem_read(frame + 24, 10))
     assert abs(alpha - 500) <= 1 and beta == -289 and period == 1600
+    for bus in (6000, 9000, 12000, 18000, 24000):
+        emu.call("CurrentAdc_SetBusVoltage", bus)
+        conversions(160)
+        assert emu.call("CurrentAdc_ReadHfi", frame)
+        alpha, beta = struct.unpack("<ii", emu.cpu.mem_read(frame + 24, 8))
+        assert abs(alpha - 500 * bus / 12000) <= 2
+        assert abs(beta + 289 * bus / 12000) <= 3
+    emu.call("CurrentAdc_SetSmoMode", 1, duties)
+    emu.call("CurrentAdc_SetSmoDuty", 600, 500, 550)
+    for bus in (6000, 9000, 12000, 18000, 24000):
+        emu.call("CurrentAdc_SetBusVoltage", bus)
+        conversions(4)
+        assert emu.call("CurrentAdc_ReadHfi", frame)
+        alpha, beta = struct.unpack("<ii", emu.cpu.mem_read(frame + 24, 8))
+        assert abs(alpha - 500 * bus / 12000) <= 2
+        assert abs(beta + 289 * bus / 12000) <= 3
     emu.call("CurrentAdc_CancelPulse")
     assert enabled == [1, 0] and emu.read32(0x4000142C) == 1200
     return {"fast_control_hz": 5000, "diagnostics_hz": 500, "voltage_preserving_changes": 2}
@@ -581,8 +613,12 @@ def check_smo_observer(elf_path):
                 emf = min(mechanical_speed * 19, 5700)
                 ea = -direction * emf * sin(theta)
                 eb = direction * emf * cos(theta)
-                va = 3.7 * ia + 1000 * (ia - pa) / sample_us + ea
-                vb = 3.7 * ib + 1000 * (ib - pb) / sample_us + eb
+                if sample_us == 200:
+                    va = 3.7 * ia - .001 * omega * ib + ea
+                    vb = 3.7 * ib + .001 * omega * ia + eb
+                else:
+                    va = 3.7 * ia + 1000 * (ia - pa) / sample_us + ea
+                    vb = 3.7 * ib + 1000 * (ib - pb) / sample_us + eb
                 emu.cpu.mem_write(inputs, struct.pack("<4i", round(va), round(vb),
                                                      round(ia), round(ib)))
                 valid = emu.call("Smo_Update", observer, config, inputs)
@@ -593,7 +629,11 @@ def check_smo_observer(elf_path):
                     raw = emu.call("Smo_ElectricalSpeedQ8", observer)
                     speeds.append(struct.unpack("<i", struct.pack("<I", raw))[0])
                     assert valid, f"SMO lost lock at {sample_us} us, direction {direction}"
-            assert max(errors) < 6, f"SMO angle error {max(errors):.2f} degrees"
+            # At 1000 rad/s, 5 kHz gives 4.49 samples per electrical turn.
+            # Bound the continuous-plant discretization error separately.
+            limit_deg = 8 if mechanical_speed == 1000 else 6
+            assert max(errors) < limit_deg, (
+                f"SMO angle error {max(errors):.2f} degrees at {mechanical_speed} rad/s")
             mean_speed = sum(speeds) / len(speeds)
             assert abs(mean_speed - speed_q8) < max(64, abs(speed_q8) * 0.06), "SMO speed"
             assert emu.call("Smo_CanTakeOver", observer), "SMO EMF qualification"
@@ -960,7 +1000,137 @@ def check_sensorless_fast_control(elf_path):
             "fast_control_us": 200, "speed_pi_us": 8000, "high_speed_loss_frames": 200}
 
 
-def check_sensorless_runtime(elf_path):
+def check_smo_continuous_weak_field(elf_path):
+    results = []
+    for speed, id_ma in ((300, 0), (400, -600), (450, -1200)):
+        for direction in (1, -1):
+            emu = Emulator(elf_path)
+            observer, config, inputs = SCRATCH, SCRATCH + 64, SCRATCH + 128
+            emu.call("Smo_Reset", observer)
+            emu.call("Smo_ConfigDefault", config)
+            emu.write32(config + 8, 200)
+            emu.write32(config + 20, 1)
+            emu.call("Smo_Prepare", config)
+            omega = direction * speed * 7
+            advance = omega * .0002
+            emu.call("Smo_Seed", observer, 0, round(advance * 16384 * 256 / (2*pi)))
+            errors = []
+            for index in range(1600):
+                angle = index * advance
+                iq = direction * 100
+                ia = id_ma * cos(angle) - iq * sin(angle)
+                ib = id_ma * sin(angle) + iq * cos(angle)
+                emf = direction * speed * 19
+                # Analytic continuous R/L plant. Its derivative does not
+                # reuse the observer's discretization.
+                va = 3.7 * ia - .001 * omega * ib - emf * sin(angle)
+                vb = 3.7 * ib + .001 * omega * ia + emf * cos(angle)
+                emu.cpu.mem_write(inputs, struct.pack("<4i", round(va), round(vb), round(ia), round(ib)))
+                valid = emu.call("Smo_Update", observer, config, inputs)
+                if index >= 1000:
+                    phase = emu.call("Smo_Angle", observer)
+                    error = (phase - angle * 16384 / (2*pi) + 8192) % 16384 - 8192
+                    errors.append(abs(error) * 360 / 16384)
+                    assert valid, "continuous weak-field observer lost lock"
+            assert max(errors) < 6, f"continuous weak-field phase error {max(errors):.2f} deg"
+            results.append({"speed_rad_s": direction * speed, "id_ma": id_ma,
+                            "maximum_phase_error_deg": round(max(errors), 3)})
+    return {"cases": results}
+
+
+def check_field_weakening(elf_path):
+    for sample_us in (200, 1600):
+        emu = Emulator(elf_path)
+        motion, output = SCRATCH, SCRATCH + 256
+        emu.call("Motion_Init", motion)
+        emu.write32(motion, 7)
+        emu.write32(motion + 72, 400)
+        emu.call("Motion_SetSamplePeriod", motion, sample_us)
+        emu.call("Motion_SetSensorless", motion, 1, 256)
+        for _ in range(640000 // sample_us - 1):
+            emu.call("Motion_Step", output, motion, 0, 15000, 400, 0)
+        assert emu.read32(motion + 72) == 1, "sampling-rate-dependent startup-field fade"
+        emu.call("Motion_Step", output, motion, 0, 15000, 400, 0)
+        assert emu.read32(motion + 72) == 0
+    for direction in (1, -1):
+        emu = Emulator(elf_path)
+        motion, output = SCRATCH, SCRATCH + 256
+        budget_roots = 0
+
+        def count_budget_roots(*_):
+            nonlocal budget_roots
+            if emu.args(1)[0] <= 2000**2:
+                budget_roots += 1
+
+        sqrt_address = emu.address("FOC_SqrtLowerBound")
+        hook = emu.cpu.hook_add(UC_HOOK_CODE, count_budget_roots, begin=sqrt_address, end=sqrt_address)
+        emu.call("Motion_Init", motion)
+        emu.write32(motion, 7)
+        emu.write32(motion + 4, direction * 400000)
+        emu.write32(motion + 100, direction * 400000)
+        emu.call("Motion_SetLimits", motion, 2000, 6928)
+        emu.call("Motion_SetSamplePeriod", motion, 200)
+        emu.call("Motion_SetSensorless", motion, 1, 256)
+
+        def signed(address):
+            return struct.unpack("<i", emu.cpu.mem_read(address, 4))[0]
+
+        def step(speed, saturated=True):
+            # Supply a controlled voltage-utilization observation. This tests
+            # the actual ARM regulator, independently of the motor plant.
+            emu.cpu.mem_write(motion + 164, struct.pack("<hh", 0, 6928 if saturated else 4000))
+            old_id = signed(motion + 72)
+            iq = signed(motion + 88)
+            emu.call("Motion_Step", output, motion, 0, speed, old_id, iq)
+            id_ref, iq_ref = signed(motion + 72), signed(motion + 88)
+            assert id_ref**2 + iq_ref**2 <= 2000**2, "field weakening exceeded total current"
+            iq_limit = struct.unpack("<H", emu.cpu.mem_read(motion + 162, 2))[0]
+            assert id_ref**2 + iq_limit**2 <= 2000**2, "cached current budget exceeds circle"
+            assert -1 <= id_ref - old_id <= 4, "field weakening changed Id discontinuously"
+            d, q = struct.unpack("<ii", emu.cpu.mem_read(output, 8))
+            assert d*d + q*q <= 6928**2, "field weakening exceeded voltage circle"
+            return id_ref
+
+        budget_roots = 0
+        try:
+            for _ in range(2000):
+                last_id = step(direction * 360000)
+        finally:
+            emu.cpu.hook_del(hook)
+        assert 0 < budget_roots <= 100, (
+            f"negative-Id budget used {budget_roots} roots in 2000 frames, expected at most 100")
+        assert -1200 <= last_id < -100, "high voltage did not produce negative Id"
+        emu.call("Motion_SetWeakening", motion, 0, 950, 1000)
+        for _ in range(2000):
+            last_id = step(direction * 360000)
+        assert last_id == 0 and signed(motion + 152) == 0, "runtime disable did not release weak field"
+        emu.call("Motion_SetWeakening", motion, 1200, 950, 1000)
+        emu.write32(motion + 152, -1200 * 64)
+        for _ in range(1600):
+            step(direction * 360000)
+        assert signed(motion + 72) == -1200, "negative Id maximum"
+        assert 1596 <= struct.unpack("<H", emu.cpu.mem_read(motion + 162, 2))[0] <= 1600
+        for _ in range(4000):
+            last_id = step(direction * 100000, False)
+        assert last_id == 0, "deceleration did not restore zero Id"
+        emu.call("Motion_SetWeakening", motion, 2000, 700, 10000)
+        for _ in range(3000):
+            last_id = step(direction * 360000)
+        assert last_id == -2000, "full configured Id range"
+        emu.call("Motion_SetWeakening", motion, 0, 950, 1000)
+        for _ in range(5200):
+            last_id = step(direction * 360000)
+        assert last_id == 0, "full-current release did not restore zero Id"
+        emu.call("Motion_SetWeakening", motion, 1200, 950, 1000)
+        emu.call("Motion_Reset", motion, 0, 0)
+        assert signed(motion + 152) == 0
+        assert struct.unpack("<3H", emu.cpu.mem_read(motion + 156, 6)) == (1200, 950, 1000)
+    return {"directions": 2, "total_current_ma": 2000, "maximum_negative_id_ma": 2000,
+            "budget_update_hz": 250,
+            "runtime_disable": True, "low_speed_release": True}
+
+
+def check_sensorless_runtime(elf_path, startup_speed=120000):
     """Replay commands through main with ideal current/observer input.
 
     The actual motor plant and ADC paths have separate checks. This replay
@@ -972,13 +1142,14 @@ def check_sensorless_runtime(elf_path):
     up, down = rtt + 24, rtt + 72
     clock = sequence = conversion_time = frame_sequence = 0
     next_diagnostic = 1000
+    diagnostic_pause_until = 0
     next_frame = 0
     period = 1600
     active = False
     motion = control = None
     decoder = FrameDecoder()
-    frames, rate_changes, enables = [], [], []
-    commands = [(200, b"@Y,60000;"), (400, b"@E;"),
+    frames, rate_changes, enables, fast_entry_fields = [], [], [], []
+    commands = [(200, f"@Y,{startup_speed};".encode()), (400, b"@E;"),
                 (4_000_000, b"@A,100000;"),
                 (5_000_000, b"@Y,-30000;"), (12_000_000, b"@X;")]
 
@@ -1027,7 +1198,7 @@ def check_sensorless_runtime(elf_path):
                 cpu.mem_write(buffer + offset, bytes([byte]))
                 offset = (offset + 1) % size
             emu.write32(down + 12, offset)
-        if clock >= next_diagnostic:
+        if clock >= next_diagnostic and clock >= diagnostic_pause_until:
             sequence += 1
             conversion_time = clock
             next_diagnostic = clock + (2000 if active else 1000)
@@ -1050,10 +1221,14 @@ def check_sensorless_runtime(elf_path):
         active = False
 
     def change_rate():
-        nonlocal period, next_frame
+        nonlocal period, next_frame, diagnostic_pause_until
         fast = bool(emu.args(1)[0])
+        if fast:
+            fast_entry_fields.append(signed(motion + 72))
         period = 200 if fast else 1600
         next_frame = clock + period
+        if not fast:
+            diagnostic_pause_until = clock + 10000
         rate_changes.append((clock, fast))
 
     def current_frame():
@@ -1114,14 +1289,20 @@ def check_sensorless_runtime(elf_path):
         "reverse command immediately withdrew SMO")
     assert all(s.speed_mrad_s > 0 for s in reverse), "requested reversal changed speed before deceleration"
     assert [fast for _, fast in rate_changes] == [True, False], f"unexpected rate transitions {rate_changes}"
+    assert fast_entry_fields and (fast_entry_fields[0] > 0 if startup_speed >= 100000
+                                  else fast_entry_fields[0] == 0), "startup-field fast-mode gate"
     assert not any(1_000_000 < timestamp < 12_000_000 and not value for timestamp, value in enables), (
         "mode handover disabled the drive")
     assert any(timestamp > 11_000_000 and s.control_source == 4 and s.speed_mrad_s < -29000
                for timestamp, s in frames), "reverse rotation did not reacquire SMO"
     assert frames[-1][1].state == 3 and not active, "runtime replay did not stop"
     assert all(s.missed_samples == 0 and s.result == 0 for _, s in frames)
+    assert any(s.state == 4 and s.event == 3 for _, s in frames), (
+        "diagnostic timeout must be reported while control remains running")
+    assert frames[-1][1].event == 3, "sample-gap warning overwrote the diagnostic timeout"
     return {"simulated_us": clock, "rate_changes": len(rate_changes),
             "reverse_under_smo": True, "reverse_smo_reacquired": True,
+            "diagnostic_pause_us": 10000, "diagnostic_timeout_keeps_control_running": True,
             "input_model": "ideal current and observer, actual application/control code"}
 
 
@@ -1306,7 +1487,7 @@ def check_rtt_packets(elf_path):
         buffer = emu.read32(up + 4)
         for offset in (0, 4, size - 4, size - 1):
             for alignment in (0, 1):
-                for length in (0, 1, 3, 4, 60, 72, 96, size - 1):
+                for length in (0, 1, 3, 4, 68, 72, 80, 96, size - 1):
                     payload = bytes((index * 19 + 7) & 255 for index in range(length))
                     emu.cpu.mem_write(SCRATCH + alignment, payload or b"\0")
                     emu.cpu.mem_write(buffer, b"\xa5" * size)
@@ -1346,13 +1527,84 @@ def check_trace_speed_analysis(_elf_path):
     return {"speed_rad_s": [15, -15, 300, -300]}
 
 
+def check_bus_voltage(elf_path):
+    emu = Emulator(elf_path)
+    output = SCRATCH
+    cases = 0
+    for bus in (6000, 7001, 9000, 12000, 18000, 23999, 24000):
+        emu.call("FOC_SetBusVoltage", bus)
+        assert emu.call("FOC_GetBusVoltage") == bus
+        assert emu.call("FOC_GetVoltageLimit") == int(bus / sqrt(3))
+        for pwm_max in (1199, 61440):
+            for fraction in range(-90, 91, 3):
+                alpha = bus * fraction // 200
+                beta = bus * (90 - abs(fraction)) // 300
+                a = alpha
+                b = int(-alpha / 2) + int(beta * 14189 / 16384)
+                c = int(-alpha / 2) - int(beta * 14189 / 16384)
+                common = int((bus - min(a, b, c) - max(a, b, c)) / 2)
+                expected = [max(0, min(pwm_max, (v + common) * pwm_max / bus)) for v in (a, b, c)]
+                emu.call("FOC_ModulateStationary", output, alpha, beta, bus, pwm_max)
+                actual = struct.unpack("<3H", emu.cpu.mem_read(output, 6))
+                assert all(abs(x - y) <= 1.1 for x, y in zip(actual, expected)), "dynamic bus PWM scaling"
+                cases += 1
+    for value in (0, 1, 2, 3, 4, 0xFFFFFFFF, *range(0, 4000001, 7919)):
+        lower = emu.call("FOC_SqrtLowerBound", value)
+        exact = isqrt(value)
+        assert 0 <= exact - lower <= exact // 512 + 1, "current-budget root bound"
+    return {"bus_range_mv": [6000, 24000], "modulation_cases": cases}
+
+
+def check_low_speed_start(elf_path):
+    return check_sensorless_runtime(elf_path, 60000)
+
+
+def check_bus_sense(elf_path):
+    emu = Emulator(elf_path)
+    header = Path(__file__).resolve().parents[2] / "firmware/BSP/Inc/bus_sense.h"
+    config = {name: int(value) for name, value in re.findall(
+        r"#define BUS_SENSE_(\w+) (\d+)u", header.read_text(encoding="utf-8"))}
+    default_mv = config["DEFAULT_MV"]
+    full_mv = config["ADC_REFERENCE_MV"] * (config["TOP_OHM"] + config["BOTTOM_OHM"]) / config["BOTTOM_OHM"]
+    normal_raw = round(default_mv * 4095 / full_mv)
+    mid_raw = round((config["KEY_PRESS_PIN_MV"] + config["KEY_RELEASE_PIN_MV"]) * 4095 /
+                    (2 * config["ADC_REFERENCE_MV"]))
+    emu.call("BusSense_Update", 0, 0)
+    assert emu.call("BusSense_Voltage") == default_mv
+    assert not emu.call("BusSense_KeyPressed")
+    for _ in range(80):
+        emu.call("BusSense_Update", normal_raw, 1)
+    before = emu.call("BusSense_Voltage")
+    assert abs(before - normal_raw * full_mv / 4095) <= 2
+    emu.call("BusSense_Update", 0, 1)
+    assert not emu.call("BusSense_KeyPressed"), "KEY debounce"
+    emu.call("BusSense_Update", 0, 1)
+    assert emu.call("BusSense_KeyPressed")
+    assert emu.call("BusSense_TakeKeyPress") and not emu.call("BusSense_TakeKeyPress")
+    assert emu.call("BusSense_Voltage") == before, "KEY altered the supply estimate"
+    emu.call("BusSense_Update", mid_raw, 1)
+    assert emu.call("BusSense_KeyPressed"), "KEY hysteresis"
+    emu.call("BusSense_Update", normal_raw, 1)
+    assert not emu.call("BusSense_KeyPressed")
+    emu.call("BusSense_Update", 0, 1)
+    emu.call("BusSense_Update", normal_raw, 1)
+    assert not emu.call("BusSense_TakeKeyPress"), "single near-zero glitch became KEY"
+    for _ in range(80):
+        emu.call("BusSense_Update", 4095, 1)
+    assert abs(emu.call("BusSense_Voltage") - full_mv) <= 2
+    emu.call("BusSense_Update", 0, 0)
+    assert emu.call("BusSense_Voltage") == default_mv and not emu.call("BusSense_KeyPressed")
+    return {"stub_mv": default_mv, "divider_ohm": [config["TOP_OHM"], config["BOTTOM_OHM"]], "key_debounce_samples": 2}
+
+
 def run_checks(elf_path):
     checks = (check_startup_and_modes, check_adc_and_pwm, check_sensorless_sampler,
               check_fixed_point, check_math_tables, check_i2c,
               check_hfi_observer, check_smo_observer, check_sensorless_handover,
               check_hfi_current_handover, check_sensorless_fast_control,
               check_sensorless_runtime, check_control_instruction_counts,
-              check_rtt_packets, check_trace_speed_analysis)
+              check_rtt_packets, check_trace_speed_analysis, check_field_weakening,
+              check_smo_continuous_weak_field, check_bus_voltage, check_low_speed_start, check_bus_sense)
     results = []
     for check in checks:
         start = time.monotonic()

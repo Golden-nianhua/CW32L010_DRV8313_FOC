@@ -10,6 +10,7 @@ from contextlib import contextmanager
 import csv
 from dataclasses import asdict, astuple, dataclass, fields
 import json
+from math import tau
 import shlex
 import struct
 import sys
@@ -17,15 +18,16 @@ import time
 from pathlib import Path
 
 MAGIC = b"FO"
-STATUS_FORMAT = struct.Struct("<HBB6BH9i3I")
-TRACE_FORMAT = struct.Struct("<II2i5H5h2BHi4H2I2H4h")
+STATUS_FORMAT = struct.Struct("<HBB6BH9i3I3H2B")
+TRACE_FORMAT = struct.Struct("<II2i5H5h2BHi4H2I2H4hhHhH")
 TRACE_FIELDS = ("sequence", "time_us", "speed_mrad_s", "hfi_speed_mrad_s", "raw_angle",
                 "electrical_angle", "hfi_angle", "adc_b", "adc_c", "id_ma", "iq_ma", "iq_ref_ma",
                 "vd_mv", "vq_mv", "observer_flags", "control_source", "index", "smo_speed_q8",
                 "smo_angle", "smo_emf_mv", "smo_error_counts", "smo_sample_us",
                 "hfi_sequence", "hfi_missed_frames", "control_angle", "injection_mv",
                 "observer_voltage_alpha_mv", "observer_voltage_beta_mv",
-                "observer_current_alpha_ma", "observer_current_beta_ma")
+                "observer_current_alpha_ma", "observer_current_beta_ma",
+                "id_ref_ma", "iq_limit_ma", "weakening_target_ma", "voltage_magnitude_mv")
 CONTROL_SOURCES = ("none", "encoder", "hfi", "to_smo", "smo", "to_hfi", "observer_lost")
 MODES = ("voltage", "current", "speed", "position", "impedance", "trajectory", "ratchet", "hfi")
 STATES = ("unaligned", "calibrating", "aligning", "ready", "running", "probing", "hfi locking")
@@ -59,18 +61,26 @@ class Status:
     missed_samples: int
     encoder_errors: int
     sample_us: int
+    bus_mv: int
+    voltage_limit_mv: int
+    supply_raw: int
+    bus_source: int
+    key_pressed: int
 
     def text(self):
         mode = label(MODES, self.mode)
         unit = label(("mV", "mA", "mrad/s", "mrad", "mrad", "mrad", "teeth/rev", "mrad/s"), self.mode)
         reference = {"ratchet": "tooth", "hfi": "control_angle"}.get(mode, "profile")
-        speed_name = "hfi_speed" if mode == "hfi" else "speed"
+        speed_name = "sensorless_speed" if mode == "hfi" else "speed"
         return (
             f"{label(STATES, self.state)} {mode} source={label(CONTROL_SOURCES, self.control_source)} "
             f"target={self.target} {unit} "
             f"pos={self.position_mrad / 1000:.3f} rad {speed_name}={self.speed_mrad_s / 1000:.3f} rad/s "
+            f"({self.speed_mrad_s * 60 / (1000 * tau):.0f} rpm) "
             f"Id/Iq={self.id_ma}/{self.iq_ma} mA Iq_ref={self.iq_ref_ma} mA "
             f"Vd/Vq={self.vd_mv}/{self.vq_mv} mV {reference}={self.profile_mrad / 1000:.3f} rad "
+            f"bus={self.bus_mv / 1000:.3f} V bus_source={label(('stub', 'manual', 'adc'), self.bus_source)} "
+            f"KEY={self.key_pressed} Vlimit={self.voltage_limit_mv / 1000:.3f} V "
             f"sample={self.sample_us} us missed={self.missed_samples} "
             f"encoder_errors={self.encoder_errors} event={label(EVENTS, self.event)}"
         )
@@ -95,7 +105,7 @@ class FrameDecoder:
             if len(self.buffer) < 4:
                 return
             version, size = self.buffer[2:4]
-            if version != 2 or size != STATUS_FORMAT.size:
+            if version != 3 or size != STATUS_FORMAT.size:
                 del self.buffer[0]
                 continue
             if len(self.buffer) < size:
@@ -282,6 +292,12 @@ def commands(parser, shell=False):
     hfi_config.add_argument("peak_current_ma", type=int, metavar="MA")
     ramp = subs.add_parser("hfi-ramp", help="set sensorless acceleration during operation, default 100 rad/s^2")
     ramp.add_argument("acceleration", type=milli, metavar="RAD_S2")
+    weakening = subs.add_parser("fw-config", help="set runtime field weakening, maximum current 0 disables it")
+    weakening.add_argument("maximum_ma", type=int, metavar="MA")
+    weakening.add_argument("utilization_permille", type=int, metavar="PERMILLE")
+    weakening.add_argument("slew_ma_s", type=int, metavar="MA_S")
+    bus = subs.add_parser("bus-voltage", help="set supply voltage while stopped; 0 selects sensing (12 V stub until PA3 is wired)")
+    bus.add_argument("voltage", type=milli, metavar="V")
     limits = subs.add_parser("limits", help="set runtime current and voltage limits")
     limits.add_argument("current_ma", type=int, metavar="MA")
     limits.add_argument("voltage_mv", type=int, metavar="MV")
@@ -342,12 +358,19 @@ def dispatch(link, args, machine=False):
             "field_current_ma": args.field_current_ma,
             "peak_current_ma": args.peak_current_ma,
         }
+    elif action == "bus-voltage":
+        status = link.command("B", args.voltage)
+        settings = {"bus_mv": status.bus_mv, "voltage_limit_mv": status.voltage_limit_mv}
     elif action == "limits":
         status = link.command("L", args.current_ma, args.voltage_mv)
         settings = {"current_ma": args.current_ma, "voltage_mv": args.voltage_mv}
     elif action == "hfi-ramp":
         status = link.command("A", args.acceleration)
         settings = {"acceleration_rad_s2": args.acceleration / 1000}
+    elif action == "fw-config":
+        status = link.command("W", args.maximum_ma, args.utilization_permille, args.slew_ma_s)
+        settings = {"maximum_ma": args.maximum_ma, "utilization_permille": args.utilization_permille,
+                    "slew_ma_s": args.slew_ma_s}
     elif action == "smo-config":
         status = link.command("O", SMO_PARAMETERS.index(args.parameter), args.value)
         settings = {args.parameter: args.value}

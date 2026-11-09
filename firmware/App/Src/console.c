@@ -11,8 +11,8 @@ typedef struct {
     CurrentPulseResponse response;
 } PulsePacket;
 
-_Static_assert(sizeof(ConsoleStatus) == 60, "RTT layout");
-_Static_assert(sizeof(ConsoleTrace) == 72, "trace layout");
+_Static_assert(sizeof(ConsoleStatus) == 68, "RTT layout");
+_Static_assert(sizeof(ConsoleTrace) == 80, "trace layout");
 _Static_assert(sizeof(PulsePacket) == 96, "pulse packet layout");
 
 static bool parse_integer(const char **cursor, int32_t *value) {
@@ -74,7 +74,7 @@ bool Console_Poll(ConsoleCommand *command) {
 
 void Console_Report(ConsoleStatus *status) {
     status->magic = FRAME_MAGIC;
-    status->version = 2;
+    status->version = 3;
     status->size = sizeof(*status);
     Rtt_Write(0, status, sizeof(*status));
 }

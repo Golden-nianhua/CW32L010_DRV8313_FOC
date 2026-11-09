@@ -38,6 +38,7 @@ set_source_files_properties(App/Src/main.c PROPERTIES COMPILE_OPTIONS "-O2")
 # the weak aliases in the vector table.
 add_library(cw32_board OBJECT
     BSP/Src/board_time.c
+    BSP/Src/bus_sense.c
     BSP/Src/bsp.c
     BSP/Src/current_adc.c
     BSP/Src/drv8313.c

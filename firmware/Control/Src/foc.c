@@ -5,6 +5,21 @@
 #define INV_SQRT3_Q14 9459
 #define HALF_SQRT3_Q14 14189
 
+static uint16_t supply_mv = 12000;
+static uint16_t supply_limit_mv = 6928;
+static uint32_t normal_gain_q21 = 209540;
+static uint32_t hfi_gain_q16 = 335544;
+
+void FOC_SetBusVoltage(uint16_t bus_mv) {
+    supply_mv = bus_mv;
+    supply_limit_mv = (uint16_t)((uint32_t)bus_mv * 37837u >> 16);
+    normal_gain_q21 = (1199u * (1u << 21) + bus_mv / 2u) / bus_mv;
+    hfi_gain_q16 = (61440u * (1u << 16) + bus_mv / 2u) / bus_mv;
+}
+
+uint16_t FOC_GetBusVoltage(void) { return supply_mv; }
+uint16_t FOC_GetVoltageLimit(void) { return supply_limit_mv; }
+
 FocAngle FOC_Angle(uint16_t phase) {
     unsigned offset = phase & 4095u;
     int32_t s = sine_quarter[offset];
@@ -55,6 +70,16 @@ uint32_t FOC_Sqrt(uint32_t value) {
     return root;
 }
 
+uint32_t FOC_SqrtLowerBound(uint32_t value) {
+    if (value == 0) return 0;
+    unsigned shift = (unsigned)__builtin_clz(value) & ~1u;
+    unsigned index = (value << shift) >> 22;
+    /* The previous bin's upper bound minus one lies below this bin.
+     * Reuse the existing table without a Newton division or extra RAM. */
+    uint32_t root = index == 256u ? 32768u : sqrt_seed[index - 257u] - 1u;
+    return root >> (shift / 2u);
+}
+
 Dq FOC_Park(int32_t current_a_ma, int32_t current_b_ma, FocAngle angle) {
     int32_t beta = (current_a_ma + 2 * current_b_ma) * INV_SQRT3_Q14 / Q14;
     return (Dq){
@@ -80,6 +105,12 @@ static uint16_t compare(int32_t voltage, uint16_t bus_mv, uint16_t pwm_max) {
         if (quotient * 12000u > numerator) --quotient;
         if ((quotient + 1u) * 12000u <= numerator) ++quotient;
         return (uint16_t)quotient;
+    }
+    if (bus_mv == supply_mv && pwm_max == 61440) {
+        return (uint16_t)(((uint32_t)voltage * hfi_gain_q16 + 32768u) >> 16);
+    }
+    if (bus_mv == supply_mv && pwm_max == 1199) {
+        return (uint16_t)(((uint32_t)voltage * normal_gain_q21 + (1u << 20)) >> 21);
     }
     return (uint16_t)((voltage * pwm_max + bus_mv / 2) / bus_mv);
 }

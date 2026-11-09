@@ -2,6 +2,7 @@
 
 #include "board_time.h"
 #include "current_adc.h"
+#include "bus_sense.h"
 #include "drv8313.h"
 #include "mt6701.h"
 #include "cw32l010_gpio.h"
@@ -15,6 +16,12 @@ static void init_key(void) {
 
     __SYSCTRL_GPIOA_CLK_ENABLE();
 
+#if BUS_SENSE_ADC_ENABLED
+    PA03_PUR_DISABLE();
+    PA03_DIR_INPUT();
+    PA03_ANALOG_ENABLE();
+    return;
+#endif
     GPIO_InitStruct.IT = GPIO_IT_RISING | GPIO_IT_FALLING;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT_PULLUP;
     GPIO_InitStruct.Pins = GPIO_PIN_3;
@@ -88,8 +95,19 @@ void GPIOA_IRQHandler(void) {
     }
 }
 
+void BSP_UpdateSupply(void) {
+    BusSense_Update(CurrentAdc_SupplyRaw(), BUS_SENSE_ADC_ENABLED);
+    if (BusSense_TakeKeyPress()) stop_requested = true;
+}
+
+uint16_t BSP_BusVoltage(void) { return BusSense_Voltage(); }
+
 bool BSP_StopPressed(void) {
-    return (CW_GPIOA->IDR & GPIO_PIN_3) == 0u;
+    bool pressed = BusSense_KeyPressed();
+#if !BUS_SENSE_ADC_ENABLED
+    pressed = pressed || (CW_GPIOA->IDR & GPIO_PIN_3) == 0u;
+#endif
+    return pressed;
 }
 
 bool BSP_StopRequested(void) {
