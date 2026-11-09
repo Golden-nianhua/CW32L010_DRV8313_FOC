@@ -1,5 +1,7 @@
 # 调试流程
 
+模型与算法推导见 [有感 FOC、HFI 与 SMO](firmware/foc-algorithms.md)，计算、采样时序与优化原理见 [FOC 实现文档](firmware/foc-implementation.md)。本页侧重命令入口与历史测量证据。
+
 固件构建产物放在 `firmware/build/Debug/` 和 `firmware/build/Release/`。以下命令可在仓库根目录执行，使用同一套 CMake 预设和 pyOCD 配置。
 
 ## 自动构建与离线回归

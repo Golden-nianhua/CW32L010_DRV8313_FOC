@@ -19,6 +19,8 @@
 
 ## 固件结构
 
+从零学习见 [FOC 教材：有感控制、HFI 与 SMO](docs/firmware/foc-algorithms.md)，按直观解释、手算例题和推导逐步展开，配有坐标与响应插图。定点、查表、采样调度及资源优化见 [FOC 实现讲义](docs/firmware/foc-implementation.md)。SMO 历史参数与实测记录保留在 [观测器记录](docs/firmware/smo.md)。
+
 | 目录 | 职责 |
 | --- | --- |
 | `firmware/App/` | 电机参数、对齐和校准顺序、位置与速度环调度、RTT 命令与帧格式 |
