@@ -76,28 +76,36 @@ void DRV8313_SetEnabled(bool enabled) {
     }
 }
 
-void DRV8313_SetHfiTiming(bool enabled) {
-    uint32_t reload = enabled ? DRV8313_HFI_PWM_MAX + 1u : PWM_RELOAD;
-    if (CW_ATIM->ARR == reload) return;
+static void set_timing(uint32_t reload, uint32_t alignment, bool audio_trigger) {
+    if (CW_ATIM->ARR == reload && (CW_ATIM->CR1 & ATIM_CR1_CMS_Msk) == alignment) return;
     uint32_t a = CW_ATIM->CCR1, b = CW_ATIM->CCR2, c = CW_ATIM->CCR4;
-    /* Preserve normalized phase voltages across the 5:1 PWM frequency change. */
-    if (enabled) {
-        a = (a + 2u) / 5u;
-        b = (b + 2u) / 5u;
-        c = (c + 2u) / 5u;
-    } else {
-        a *= 5u;
-        b *= 5u;
-        c *= 5u;
-    }
+    uint32_t previous = CW_ATIM->ARR;
+    a = (a * reload + previous / 2u) / previous;
+    b = (b * reload + previous / 2u) / previous;
+    c = (c * reload + previous / 2u) / previous;
     ATIM_Cmd(DISABLE);
+    CW_ATIM->CR1 = (CW_ATIM->CR1 & ~ATIM_CR1_CMS_Msk) | alignment;
     ATIM_SetCounterValue(0);
     ATIM_SetReloadValue(reload);
-    ATIM_SetCompare5(enabled ? 24u : 96u);
+    ATIM_OCInitTypeDef trigger = {0};
+    trigger.OCMode = ATIM_OCMODE_FORCED_INACTIVE;
+    trigger.OCPolarity = ATIM_OCPOLARITY_NONINVERT;
+    ATIM_OC5Init(&trigger);
+    trigger.OCMode = audio_trigger ? ATIM_OCMODE_TOGGLE : ATIM_OCMODE_PWM2;
+    ATIM_OC5Init(&trigger);
+    ATIM_SetCompare5(reload < PWM_RELOAD ? 24u : 96u);
     DRV8313_SetDuty((uint16_t)a, (uint16_t)b, (uint16_t)c);
     /* Commit buffered compare values against the new period before restarting. */
     CW_ATIM->EGR = ATIM_EGR_UG_Msk;
     ATIM_Cmd(ENABLE);
+}
+
+void DRV8313_SetHfiTiming(bool enabled) {
+    set_timing(enabled ? DRV8313_HFI_PWM_MAX + 1u : PWM_RELOAD, ATIM_COUNT_ALIGN_MODE_CENTER_BOTH, false);
+}
+void DRV8313_SetAudioTiming(bool enabled) {
+    set_timing(enabled ? 500u : PWM_RELOAD,
+               enabled ? ATIM_COUNT_ALIGN_MODE_EDGE : ATIM_COUNT_ALIGN_MODE_CENTER_BOTH, enabled);
 }
 
 __attribute__((section(".RamFunc"))) void DRV8313_SetDuty(uint16_t a, uint16_t b, uint16_t c) {

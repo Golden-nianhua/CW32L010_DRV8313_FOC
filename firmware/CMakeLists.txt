@@ -42,10 +42,12 @@ add_library(cw32_board OBJECT
     BSP/Src/bsp.c
     BSP/Src/current_adc.c
     BSP/Src/drv8313.c
+    BSP/Src/motor_audio.c
     BSP/Src/mt6701.c
 )
-target_include_directories(cw32_board PUBLIC BSP/Inc)
+target_include_directories(cw32_board PUBLIC BSP/Inc PRIVATE Core/Inc)
 target_link_libraries(cw32_board PRIVATE cw32_spl)
+set_source_files_properties(BSP/Src/motor_audio.c PROPERTIES COMPILE_OPTIONS "-O3")
 set_source_files_properties(BSP/Src/drv8313.c
     PROPERTIES COMPILE_OPTIONS "-O2")
 set_source_files_properties(BSP/Src/current_adc.c

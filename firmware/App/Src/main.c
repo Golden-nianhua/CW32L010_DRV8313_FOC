@@ -1,6 +1,7 @@
 #include "board_time.h"
 #include "bsp.h"
 #include "bus_sense.h"
+#include "motor_audio.h"
 #include "console.h"
 #include "current_adc.h"
 #include "drv8313.h"
@@ -79,6 +80,7 @@ typedef struct {
     uint8_t pulse_periods;
     int32_t position_fraction;
     int32_t ratchet_speed;
+    int32_t audio_peak_mv;
     bool have_encoder;
     bool have_current_zero;
     bool hfi_starting;
@@ -93,7 +95,27 @@ static void apply_voltage(Dq voltage, FocAngle angle) {
     DRV8313_SetDuty(duty.a, duty.b, duty.c);
 }
 
+static void audio_voltage(MotorApp *app, Dq voltage, FocAngle angle) {
+    uint16_t bus = FOC_GetBusVoltage();
+    PhaseDuty duty = FOC_Modulate(voltage, angle, bus, 64000);
+    int32_t base[3] = {duty.a, duty.b, duty.c};
+    int32_t alpha = app->audio_peak_mv * angle.cos_q14 / 16384;
+    int32_t beta = app->audio_peak_mv * angle.sin_q14 / 16384;
+    int32_t gain[3] = {alpha, -alpha / 2 + beta * 14189 / 16384,
+                            -alpha / 2 - beta * 14189 / 16384};
+    for (unsigned i = 0; i < 3; ++i) {
+        gain[i] = gain[i] * 64000 / bus;
+        if (gain[i] < -64000) gain[i] = -64000;
+        if (gain[i] > 64000) gain[i] = 64000;
+    }
+    MotorAudio_SetTargets(base, gain);
+}
+
 static void stop(MotorApp *app) {
+    if (app->audio_peak_mv != 0) {
+        CurrentAdc_StopAudio();
+        app->audio_peak_mv = 0;
+    }
     if (app->state == PROBING || app->state == HFI_LOCKING ||
         (app->state == RUNNING && app->motion.request.mode == MOTOR_HFI)) CurrentAdc_CancelPulse();
     DRV8313_SetEnabled(false);
@@ -252,6 +274,8 @@ static CommandResult set_mode(MotorApp *app, const ConsoleCommand *command, Moto
 
 static CommandResult command_result(MotorApp *app, const ConsoleCommand *command) {
     if (!command->valid) return BAD_ARGUMENT;
+    if (app->audio_peak_mv != 0 && command->code != 'X' && command->code != 'Q' &&
+        command->code != 'M' && command->code != 'S' && command->code != 'R') return BAD_STATE;
     if (app->state == PROBING && command->code != 'X' && command->code != 'Q') return BAD_STATE;
     if (app->motion.request.mode == MOTOR_HFI && app->state != READY && app->state != UNALIGNED &&
         command->code != 'X' && command->code != 'Q' && command->code != 'Y' &&
@@ -271,6 +295,25 @@ static CommandResult command_result(MotorApp *app, const ConsoleCommand *command
             if (command->count != 1 ||
                 !in_range(args[0], 5000, MOTOR_HFI_ACCEL_MAX_MRAD_S2)) return BAD_ARGUMENT;
             app->motion.hfi_acceleration_mrad_s2 = args[0];
+            return OK;
+        case 'M':
+            if (command->count == 1 && args[0] == 0) {
+                if (app->audio_peak_mv != 0) {
+                    CurrentAdc_StopAudio();
+                    app->audio_peak_mv = 0;
+                }
+                return OK;
+            }
+            if (command->count != 3 || !in_range(args[0], 1, 6000) || args[1] < 1 ||
+                !in_range(args[2], 0, 1)) return BAD_ARGUMENT;
+            int32_t used_d = app->status.vd < 0 ? -app->status.vd : app->status.vd;
+            int32_t used_q = app->status.vq < 0 ? -app->status.vq : app->status.vq;
+            if (args[0] + used_d + used_q > app->motion.voltage_limit_mv) return BAD_ARGUMENT;
+            if (app->state != RUNNING || app->motion.request.mode != MOTOR_SPEED ||
+                app->audio_peak_mv != 0 || app->trace_index != app->trace_count) return BAD_STATE;
+            app->audio_peak_mv = args[0];
+            CurrentAdc_StartAudio(app->zero_b, app->zero_c, (uint32_t)args[1], args[2] != 0);
+            audio_voltage(app, (Dq){app->status.vd, app->status.vq}, FOC_Angle(electrical_angle(app)));
             return OK;
         case 'B':
             if (command->count != 1 || (args[0] != 0 && !in_range(args[0], MOTOR_BUS_MIN_MV, MOTOR_BUS_MAX_MV))) return BAD_ARGUMENT;
@@ -681,7 +724,8 @@ static void process_sample(MotorApp *app, uint16_t raw_b, uint16_t raw_c, uint32
         Dq voltage = Motion_Step(&app->motion, app->status.position, speed, current);
         app->status.vd = voltage.d;
         app->status.vq = voltage.q;
-        apply_voltage(voltage, angle);
+        if (app->audio_peak_mv != 0) audio_voltage(app, voltage, angle);
+        else apply_voltage(voltage, angle);
         smo_voltage(app, voltage, angle);
     }
 }
@@ -691,6 +735,8 @@ static void report(MotorApp *app) {
     app->status.control_source = app->state == RUNNING || app->state == HFI_LOCKING
         ? (app->motion.request.mode == MOTOR_HFI ? app->sensorless.source : CONTROL_ENCODER)
         : CONTROL_NONE;
+    app->status.audio_frames = MotorAudio_Frames();
+    app->status.audio_underruns = MotorAudio_Underruns();
     app->status.bus_source = app->bus_manual_override ? 1 : (BUS_SENSE_ADC_ENABLED ? 2 : 0);
     app->status.supply_raw = CurrentAdc_SupplyRaw();
     app->status.key_pressed = BSP_StopPressed();
@@ -800,6 +846,10 @@ int main(void) {
         uint32_t sequence = app.encoder_pending ? app.adc_sequence
             : CurrentAdc_Next(&raw_b, &raw_c, &conversion_time);
         uint32_t now = BoardTime_NowUs();
+        if (app.audio_peak_mv != 0 && !CurrentAdc_PulseActive()) {
+            app.status.event = CurrentAdc_PulseFault() == 1 ? CURRENT_HIGH : SAMPLE_TIMEOUT;
+            stop(&app);
+        }
         if (app.motion.request.mode == MOTOR_HFI &&
             (app.state == HFI_LOCKING || app.state == RUNNING)) process_hfi(&app, now);
         if (app.state == ALIGNING && app.hfi_starting && app.hfi_pre_align &&

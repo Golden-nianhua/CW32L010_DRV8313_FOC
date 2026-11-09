@@ -28,6 +28,8 @@ typedef struct {
 } CurrentHfiFrame;
 
 void CurrentAdc_Init(void);
+void CurrentAdc_StartAudio(uint16_t zero_b, uint16_t zero_c, uint32_t frames, bool mulaw);
+void CurrentAdc_StopAudio(void);
 uint16_t CurrentAdc_SupplyRaw(void);
 /* Main-context supply update for duty-to-voltage reconstruction. */
 void CurrentAdc_SetBusVoltage(uint16_t bus_mv);

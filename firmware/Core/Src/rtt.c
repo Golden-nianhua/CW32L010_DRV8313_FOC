@@ -20,7 +20,7 @@ typedef struct {
     uint32_t up_count;
     uint32_t down_count;
     RttChannel up[2];
-    RttChannel down;
+    RttChannel down[2];
 } RttControlBlock;
 
 /* Publish ordinary RAM payloads through the volatile write offset after DMB. */
@@ -32,12 +32,15 @@ static volatile uint8_t down_data[RTT_DOWN_SIZE];
 RttControlBlock _SEGGER_RTT = {
     .id = "SEGGER RTT",
     .up_count = 2,
-    .down_count = 1,
+    .down_count = 2,
     .up = {
         {.name = "Terminal", .data = up_data, .size = RTT_UP_SIZE},
         {.name = "FOC trace", .data = trace_data, .size = RTT_TRACE_SIZE},
     },
-    .down = {.name = "Terminal", .data = down_data, .size = RTT_DOWN_SIZE},
+    .down = {
+        {.name = "Terminal", .data = down_data, .size = RTT_DOWN_SIZE},
+        {.name = "PCM16", .data = trace_data, .size = RTT_TRACE_SIZE},
+    },
 };
 
 static void copy_bytes(uint8_t *destination, const uint8_t *source, size_t length) {
@@ -53,7 +56,10 @@ static void copy_bytes(uint8_t *destination, const uint8_t *source, size_t lengt
     while (length-- != 0) *destination++ = *source++;
 }
 
+static bool audio_owns_trace;
+
 void Rtt_Write(unsigned channel, const void *data, size_t length) {
+    if (channel == 1 && audio_owns_trace) return;
     RttChannel *up = &_SEGGER_RTT.up[channel];
     uint32_t mask = up->size - 1u;
     uint32_t offset = up->write_offset;
@@ -71,14 +77,39 @@ void Rtt_Write(unsigned channel, const void *data, size_t length) {
 }
 
 bool Rtt_ReadByte(char *byte) {
-    uint32_t offset = _SEGGER_RTT.down.read_offset;
-    if (offset == _SEGGER_RTT.down.write_offset) {
+    uint32_t offset = _SEGGER_RTT.down[0].read_offset;
+    if (offset == _SEGGER_RTT.down[0].write_offset) {
         return false;
     }
 
     __DMB();
     *byte = down_data[offset];
     __DMB();
-    _SEGGER_RTT.down.read_offset = (offset + 1u) & (RTT_DOWN_SIZE - 1u);
+    _SEGGER_RTT.down[0].read_offset = (offset + 1u) & (RTT_DOWN_SIZE - 1u);
+    return true;
+}
+
+void Rtt_AudioBegin(void) {
+    _SEGGER_RTT.down[1].read_offset = _SEGGER_RTT.down[1].write_offset = 0;
+    audio_owns_trace = true;
+}
+void Rtt_AudioEnd(void) { audio_owns_trace = false; }
+uint32_t Rtt_AudioAvailable(void) {
+    return (_SEGGER_RTT.down[1].write_offset - _SEGGER_RTT.down[1].read_offset) & (RTT_TRACE_SIZE - 1u);
+}
+bool Rtt_ReadAudio(int16_t *sample, bool mulaw) {
+    uint32_t bytes = mulaw ? 1u : 2u;
+    if (Rtt_AudioAvailable() < bytes) return false;
+    uint32_t offset = _SEGGER_RTT.down[1].read_offset;
+    __DMB();
+    if (mulaw) {
+        unsigned code = (unsigned)(~trace_data[offset]) & 255u;
+        int32_t magnitude = (((code & 15u) << 3) + 132u) << ((code >> 4) & 7u);
+        *sample = (int16_t)((code & 128u) ? 132 - magnitude : magnitude - 132);
+    } else {
+        *sample = (int16_t)(trace_data[offset] | ((uint16_t)trace_data[(offset + 1u) & (RTT_TRACE_SIZE - 1u)] << 8));
+    }
+    __DMB();
+    _SEGGER_RTT.down[1].read_offset = (offset + bytes) & (RTT_TRACE_SIZE - 1u);
     return true;
 }

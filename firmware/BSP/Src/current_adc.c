@@ -1,5 +1,6 @@
 #include "current_adc.h"
 #include "bus_sense.h"
+#include "motor_audio.h"
 
 #include <string.h>
 #include "drv8313.h"
@@ -58,6 +59,7 @@ static struct {
     bool rotating;
     bool continuous;
     bool fast_smo;
+    bool audio;
     volatile bool active;
 } pulse;
 
@@ -83,6 +85,7 @@ typedef struct {
 static union {
     CurrentPulseResponse response[CURRENT_PULSE_VECTORS];
     HfiState hfi;
+    struct { uint32_t state[MOTOR_AUDIO_STATE_WORDS]; uint32_t sum_b, sum_c; } audio;
 } measurement;
 
 /* At 2 A, 38 samples reach 47158 counts per vector. Keep accumulation in
@@ -183,6 +186,7 @@ static void start(uint16_t duty[CURRENT_PULSE_VECTORS + 1][3], uint8_t periods,
     pulse.fault = 0;
     pulse.continuous = continuous;
     pulse.fast_smo = false;
+    pulse.audio = false;
     pulse.rotating = periods == 0;
     uint32_t mask = __get_PRIMASK();
     __disable_irq();
@@ -327,6 +331,40 @@ bool CurrentAdc_PulseActive(void) { return pulse.active; }
 uint16_t CurrentAdc_PulseFault(void) { return pulse.fault; }
 const CurrentPulseResponse *CurrentAdc_PulseResponses(void) { return measurement.response; }
 
+void CurrentAdc_StartAudio(uint16_t zero_b, uint16_t zero_c, uint32_t frames, bool mulaw) {
+    MotorAudio_Begin(measurement.audio.state, frames, mulaw);
+    measurement.audio.sum_b = measurement.audio.sum_c = 0;
+    uint32_t mask = __get_PRIMASK();
+    __disable_irq();
+    pulse.zero_b = zero_b;
+    pulse.zero_c = zero_c;
+    pulse.fault = 0;
+    pulse.audio = true;
+    pulse.rotating = true;
+    pulse.continuous = pulse.fast_smo = false;
+    control_divider = 48;
+    pwm_periods = 0;
+    DRV8313_SetAudioTiming(true);
+    ADC_ClearITPendingAll();
+    NVIC_ClearPendingIRQ(ADC_IRQn);
+    pulse.active = true;
+    __set_PRIMASK(mask);
+}
+
+void CurrentAdc_StopAudio(void) {
+    uint32_t mask = __get_PRIMASK();
+    __disable_irq();
+    pulse.active = pulse.audio = false;
+    pulse.rotating = false;
+    control_divider = 20;
+    pwm_periods = 0;
+    DRV8313_SetAudioTiming(false);
+    ADC_ClearITPendingAll();
+    NVIC_ClearPendingIRQ(ADC_IRQn);
+    MotorAudio_End();
+    __set_PRIMASK(mask);
+}
+
 static bool pulse_overcurrent(int32_t counts, int32_t limit) {
     return counts < -limit || counts > limit;
 }
@@ -400,6 +438,19 @@ __attribute__((noinline)) static void rotating_sample(int32_t b, int32_t c) {
 }
 
 __attribute__((noinline)) static void pulse_sample(uint16_t raw_b, uint16_t raw_c) {
+    if (pulse.audio) {
+        int32_t b = (int32_t)raw_b - pulse.zero_b, c = (int32_t)raw_c - pulse.zero_c;
+        int32_t limit = hfi_max_current_counts;
+        if (pulse_overcurrent(b, limit) || pulse_overcurrent(c, limit) || pulse_overcurrent(b + c, limit)) {
+            pulse_finish(1);
+            pulse.audio = false;
+            return;
+        }
+        measurement.audio.sum_b += raw_b;
+        measurement.audio.sum_c += raw_c;
+        MotorAudio_Tick();
+        return;
+    }
     int32_t b = (int32_t)raw_b - pulse.zero_b;
     int32_t c = (int32_t)raw_c - pulse.zero_c;
     int32_t limit = pulse.continuous ? hfi_max_current_counts : PULSE_MAX_CURRENT_COUNTS;
@@ -552,6 +603,12 @@ __attribute__((noinline)) static void smo_sample(int32_t b, int32_t c) {
     }
 }
 
+__attribute__((noinline)) static void audio_snapshot(CurrentSample *sample) {
+    sample->b = (uint16_t)(measurement.audio.sum_b / 48u);
+    sample->c = (uint16_t)(measurement.audio.sum_c / 48u);
+    measurement.audio.sum_b = measurement.audio.sum_c = 0;
+}
+
 __attribute__((section(".RamFunc"))) void ADC_IRQHandler(void) {
     if (CW_ADC->ISR & ADC_ISR_EOS_Msk) {
         if (pulse.active) {
@@ -567,8 +624,12 @@ __attribute__((section(".RamFunc"))) void ADC_IRQHandler(void) {
         if (++pwm_periods == control_divider) {
             pwm_periods = 0;
             CurrentSample *sample = &samples[(sequence + 1u) & (SAMPLE_QUEUE_SIZE - 1u)];
-            sample->b = (uint16_t)CW_ADC->RESULT0;
-            sample->c = (uint16_t)CW_ADC->RESULT1;
+            if (pulse.audio) {
+                audio_snapshot(sample);
+            } else {
+                sample->b = (uint16_t)CW_ADC->RESULT0;
+                sample->c = (uint16_t)CW_ADC->RESULT1;
+            }
 #if BUS_SENSE_ADC_ENABLED
             supply_raw = (uint16_t)CW_ADC->RESULT2;
 #endif

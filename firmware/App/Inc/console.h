@@ -42,6 +42,8 @@ typedef struct {
     uint16_t supply_raw;
     uint8_t bus_source;
     uint8_t key_pressed;
+    uint32_t audio_frames;
+    uint32_t audio_underruns;
 } ConsoleStatus;
 
 typedef struct {

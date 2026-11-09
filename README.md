@@ -153,6 +153,22 @@ PA3 的 ADC／KEY 流程已接入。配置位于 `firmware/BSP/Inc/bus_sense.h`�
 
 真实采样下，PA3 接近 0 V 连续两次判定 KEY 按下，按下期间保持上一次母线估计；释放采用迟滞。主循环消费 ADC 原始值、滤波并通过 `set_bus_voltage()` 更新调制、电压重建和限幅。状态另发送 `supply_raw` 与 `key_pressed`。
 
+## 电机播放歌曲
+
+在仓库根目录运行，文件路径加引号即可指定任意 FFmpeg 支持的本地音频，如 MP3、FLAC、WAV、M4A。首次运行由 `uv` 安装依赖，FFmpeg 随 Python 包提供，无需单独安装。主机完成解码、单声道 48 kHz 重采样和均衡，固件接收二进制采样并输出。
+
+```powershell
+uv run --script tools/host/foc.py play "D:\音乐\歌曲.flac"
+uv run --script tools/host/foc.py play "ilem、洛天依 - 大氿歌.flac" --start 45 --seconds 8
+uv run --script tools/host/foc.py play "D:\音乐\歌曲.mp3" --speed 15
+```
+
+默认播放至文件结束、静止发声、峰值 5.5 V、低频增益 12 dB、高频补偿 270 µs；与最后一轮停转试听设置一致。`--speed` 指定有感闭环的机械速度，范围 ±30 rad/s，0 为静止。每次播放先停机、测电流零点并对齐，再进入速度模式，结束、异常或 Ctrl+C 时发送停机。静止播放的校准阶段也会短暂移动。当前播放采用编码器控制。
+
+`--amplitude 4` 调整峰值电压，`--bass-db 6` 调整低频增益，`--preemphasis-us 270` 调整高频补偿。音频会统一归一化峰值，因此增加低频增益会相应减少其他频段的幅度。默认使用 μ-law 8 位传输、固件还原为 16 位，传输量约 48 KB/s；`--transport pcm16` 为 96 KB/s，对 SWD 吞吐要求更高。直接 `play` 默认 SWD 8 MHz；交互方式使用 `uv run --script tools/host/foc.py --frequency 8000000 shell`，然后输入相同的 `play` 命令。
+
+这是资源受限的实验播放功能：最后一轮 8 秒试听仍有 1 次缓冲断流，实际约 8.54 秒，低频响度也受电机结构限制。本次保留该效果。播放后输出耗时和断流次数；`--json play ...` 输出结构化结果，断流或明显时长偏差以警告报告并返回退出码 1。歌曲文件保留在本机，不纳入 Git。
+
 ## RTT 遥测
 
 固件运行后，可在仓库根目录通过 SWD 将 RTT 上行数据采集为二进制文件。
@@ -161,4 +177,4 @@ PA3 的 ADC／KEY 流程已接入。配置位于 `firmware/BSP/Inc/bus_sense.h`�
 uv tool run --python 3.12 --managed-python --from pyocd==0.46.0 pyocd rtt --project tools/pyocd --connect attach --address 0x20000000 --size 0x1000 --log-file telemetry.bin
 ```
 
-上行通道 0 输出 68 字节整数遥测帧，由上位机解码。下行位置命令为 `@P,<目标角度>;`，单位 mrad。例如 `@P,1571;` 对应 1.571 rad。上行空间不足时整帧丢弃。帧格式与接线见[硬件接口](docs/hardware/hardware-interfaces.md#swd-与-rtt)。
+上行通道 0 输出 76 字节整数遥测帧，由上位机解码。下行位置命令为 `@P,<目标角度>;`，单位 mrad。例如 `@P,1571;` 对应 1.571 rad。上行空间不足时整帧丢弃。帧格式与接线见[硬件接口](docs/hardware/hardware-interfaces.md#swd-与-rtt)。

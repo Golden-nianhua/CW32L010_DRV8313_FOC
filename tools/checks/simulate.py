@@ -1487,7 +1487,7 @@ def check_rtt_packets(elf_path):
         buffer = emu.read32(up + 4)
         for offset in (0, 4, size - 4, size - 1):
             for alignment in (0, 1):
-                for length in (0, 1, 3, 4, 68, 72, 80, 96, size - 1):
+                for length in (0, 1, 3, 4, 76, 72, 80, 96, size - 1):
                     payload = bytes((index * 19 + 7) & 255 for index in range(length))
                     emu.cpu.mem_write(SCRATCH + alignment, payload or b"\0")
                     emu.cpu.mem_write(buffer, b"\xa5" * size)
@@ -1597,6 +1597,110 @@ def check_bus_sense(elf_path):
     return {"stub_mv": default_mv, "divider_ohm": [config["TOP_OHM"], config["BOTTOM_OHM"]], "key_debounce_samples": 2}
 
 
+def check_motor_audio(elf_path):
+    emu = Emulator(elf_path)
+    for address, size in ((0x40000000, 0x2000), (0x40004000, 0x1000),
+                          (0x48000000, 0x1000), (0xE000E000, 0x1000)):
+        emu.cpu.mem_map(address, size)
+    emu.call("CurrentAdc_Init")
+    emu.call("DRV8313_Init")
+    enabled = []
+    emu.stub("DRV8313_SetEnabled", lambda: enabled.append(emu.args(1)[0]))
+    down = emu.address("_SEGGER_RTT") + 96
+    buffer = emu.read32(down + 4)
+    frame = SCRATCH + 128
+    emu.call("CurrentAdc_StartAudio", 2048, 2050, 256, 0)
+    assert emu.read32(0x4000142C) == 500, "96 kHz edge-aligned PWM"
+    emu.cpu.mem_write(SCRATCH, struct.pack("<6i", 32000, 32000, 32000, 8000, -4000, -4000))
+    emu.call("MotorAudio_SetTargets", SCRATCH, SCRATCH + 12)
+    payload = struct.pack("<128h", *([12000, -12000] * 64))
+    emu.cpu.mem_write(buffer, payload)
+    emu.write32(down + 12, len(payload))
+
+    def conversions(count):
+        for _ in range(count):
+            emu.write32(0x4000007C, 2)
+            emu.write32(0x40000040, 2048)
+            emu.write32(0x40000044, 2050)
+            emu.call("ADC_IRQHandler")
+            assert all(0 <= emu.read32(address) <= 500
+                       for address in (0x40001434, 0x40001438, 0x40001440)), "audio PWM range"
+
+    conversions(48)
+    assert emu.call("MotorAudio_Frames") == 48, "48 kHz sample cadence"
+    assert emu.call("CurrentAdc_Next", frame, frame + 2, frame + 4) == 1
+    assert struct.unpack("<2H", emu.cpu.mem_read(frame, 4)) == (2048, 2050), "audio current averaging"
+    conversions(81)
+    assert emu.call("MotorAudio_Frames") == 128 and emu.call("MotorAudio_Underruns") == 1
+    conversions(20)
+    assert emu.call("MotorAudio_Underruns") == 1, "continuous starvation counted repeatedly"
+    emu.cpu.mem_write(buffer + 256, payload)
+    emu.write32(down + 12, 0)
+    conversions(128)
+    assert emu.call("MotorAudio_Frames") == 256 and emu.call("MotorAudio_Underruns") == 1
+    conversions(16)
+    assert emu.call("MotorAudio_Underruns") == 1, "EOF counted as starvation"
+    emu.call("CurrentAdc_StopAudio")
+    assert emu.read32(0x4000142C) == 1200 and not emu.call("CurrentAdc_PulseActive")
+    emu.call("CurrentAdc_StartAudio", 2048, 2050, 16, 0)
+    emu.write32(0x40000040, 3290)
+    emu.call("ADC_IRQHandler")
+    assert emu.call("CurrentAdc_PulseFault") == 1 and enabled[-1] == 0, "audio overcurrent trip"
+    emu.call("CurrentAdc_StopAudio")
+    emu.call("Rtt_AudioBegin")
+    emu.cpu.mem_write(buffer, bytes((255, 127, 128, 0)))
+    emu.write32(down + 12, 4)
+    for expected in (0, 0, 32124, -32124):
+        assert emu.call("Rtt_ReadAudio", SCRATCH, 1)
+        assert struct.unpack("<h", emu.cpu.mem_read(SCRATCH, 2))[0] == expected
+    emu.call("Rtt_AudioEnd")
+    return {"sample_rate": 48000, "pwm_rate": 96000, "frames": 256,
+            "starvation_recovery": True, "instantaneous_overcurrent_trip": True}
+
+
+def check_audio_writer(_elf_path):
+    from host.audio import AudioWriter
+
+    class Target:
+        def __init__(self):
+            self.memory = bytearray(2048)
+            self.writes = 0
+
+        def read32(self, address):
+            return struct.unpack_from("<I", self.memory, address)[0]
+
+        def write32(self, address, value):
+            struct.pack_into("<I", self.memory, address, value)
+            self.writes += 1
+
+        def write_memory_block32(self, address, words):
+            assert address % 4 == 0, "unaligned audio word transfer"
+            self.memory[address:address + len(words)*4] = struct.pack(f"<{len(words)}I", *words)
+
+        def write_memory_block8(self, address, data):
+            self.memory[address:address + len(data)] = data
+
+    target = Target()
+    target.write32(64, 508)
+    target.write32(68, 400)
+    channel = SimpleNamespace(_target=target, _offsets_addr=64, _buffer_address=1024, size=512)
+    writer = AudioWriter(channel)
+    payload = bytes(index & 255 for index in range(600))
+    assert writer.write(payload) == 400
+    assert target.memory[1532:1536] == payload[:4]
+    assert target.memory[1024:1420] == payload[4:400]
+    assert target.read32(64) == 396
+    target.write32(68, 397)
+    writes = target.writes
+    assert writer.write(b"abcd") == 0 and target.writes == writes
+    target.write32(68, 400)
+    assert writer.write(b"abcdef") == 0, "partial chunk lost word alignment"
+    target.write32(68, 0)
+    assert writer.write(b"xyz") == 3
+    assert target.memory[1420:1423] == b"xyz" and target.read32(64) == 399
+    return {"wrapped_bytes": 400, "full_buffer_no_write": True, "final_tail_bytes": 3}
+
+
 def run_checks(elf_path):
     checks = (check_startup_and_modes, check_adc_and_pwm, check_sensorless_sampler,
               check_fixed_point, check_math_tables, check_i2c,
@@ -1604,7 +1708,7 @@ def run_checks(elf_path):
               check_hfi_current_handover, check_sensorless_fast_control,
               check_sensorless_runtime, check_control_instruction_counts,
               check_rtt_packets, check_trace_speed_analysis, check_field_weakening,
-              check_smo_continuous_weak_field, check_bus_voltage, check_low_speed_start, check_bus_sense)
+              check_smo_continuous_weak_field, check_bus_voltage, check_low_speed_start, check_bus_sense, check_motor_audio, check_audio_writer)
     results = []
     for check in checks:
         start = time.monotonic()

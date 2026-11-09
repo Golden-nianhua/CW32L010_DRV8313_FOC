@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["pyocd==0.46.0"]
+# dependencies = ["pyocd==0.46.0", "imageio-ffmpeg>=0.6", "scipy>=1.14"]
 # ///
 
 """CW32L010 FOC console over SWD RTT."""
@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 MAGIC = b"FO"
-STATUS_FORMAT = struct.Struct("<HBB6BH9i3I3H2B")
+STATUS_FORMAT = struct.Struct("<HBB6BH9i3I3H2B2I")
 TRACE_FORMAT = struct.Struct("<II2i5H5h2BHi4H2I2H4hhHhH")
 TRACE_FIELDS = ("sequence", "time_us", "speed_mrad_s", "hfi_speed_mrad_s", "raw_angle",
                 "electrical_angle", "hfi_angle", "adc_b", "adc_c", "id_ma", "iq_ma", "iq_ref_ma",
@@ -66,6 +66,8 @@ class Status:
     supply_raw: int
     bus_source: int
     key_pressed: int
+    audio_frames: int
+    audio_underruns: int
 
     def text(self):
         mode = label(MODES, self.mode)
@@ -80,7 +82,7 @@ class Status:
             f"Id/Iq={self.id_ma}/{self.iq_ma} mA Iq_ref={self.iq_ref_ma} mA "
             f"Vd/Vq={self.vd_mv}/{self.vq_mv} mV {reference}={self.profile_mrad / 1000:.3f} rad "
             f"bus={self.bus_mv / 1000:.3f} V bus_source={label(('stub', 'manual', 'adc'), self.bus_source)} "
-            f"KEY={self.key_pressed} Vlimit={self.voltage_limit_mv / 1000:.3f} V "
+            f"KEY={self.key_pressed} audio={self.audio_frames}/{self.audio_underruns} Vlimit={self.voltage_limit_mv / 1000:.3f} V "
             f"sample={self.sample_us} us missed={self.missed_samples} "
             f"encoder_errors={self.encoder_errors} event={label(EVENTS, self.event)}"
         )
@@ -105,7 +107,7 @@ class FrameDecoder:
             if len(self.buffer) < 4:
                 return
             version, size = self.buffer[2:4]
-            if version != 3 or size != STATUS_FORMAT.size:
+            if version != 4 or size != STATUS_FORMAT.size:
                 del self.buffer[0]
                 continue
             if len(self.buffer) < size:
@@ -116,11 +118,13 @@ class FrameDecoder:
 
 
 class Link:
-    def __init__(self, up, down, timeout, trace_up=None):
+    def __init__(self, up, down, timeout, trace_up=None, audio_down=None, directory=None):
         self.up = up
         self.down = down
         self.timeout = timeout
         self.trace_up = trace_up
+        self.audio_down = audio_down
+        self.directory = Path.cwd() if directory is None else directory
         self.decoder = FrameDecoder()
         self.latest = None
 
@@ -210,6 +214,7 @@ def open_link(probe=None, frequency=None, timeout=2.0, target_state=None):
     from pyocd.core.helpers import ConnectHelper
     from pyocd.debug.rtt import RTTControlBlock
 
+    directory = Path.cwd()
     options = {} if frequency is None else {"frequency": frequency}
     session = ConnectHelper.session_with_chosen_probe(
         project_dir=str(PYOCD_PROJECT), unique_id=probe, connect_mode="attach",
@@ -230,7 +235,8 @@ def open_link(probe=None, frequency=None, timeout=2.0, target_state=None):
         if not rtt.up_channels or not rtt.down_channels:
             raise RuntimeError("firmware RTT channel 0 is unavailable")
         trace_up = rtt.up_channels[1] if len(rtt.up_channels) > 1 else None
-        yield Link(rtt.up_channels[0], rtt.down_channels[0], timeout, trace_up)
+        yield Link(rtt.up_channels[0], rtt.down_channels[0], timeout, trace_up,
+                   rtt.down_channels[1] if len(rtt.down_channels) > 1 else None, directory)
 
 
 def probe_inventory(selector=None):
@@ -281,6 +287,15 @@ def commands(parser, shell=False):
         subs.add_parser(action)
     if not shell:
         subs.add_parser("shell", help="keep one RTT session open for interactive commands")
+    play = subs.add_parser("play", help="play an audio file through the motor at 48 kHz")
+    play.add_argument("file", type=Path)
+    play.add_argument("--seconds", type=positive, default=None, help="duration in seconds; omit to play to the end")
+    play.add_argument("--start", type=float, default=0.0, help="start position in seconds")
+    play.add_argument("--speed", type=milli, default=0, metavar="RAD_S", help="encoder speed, -30 to 30 rad/s; 0 holds still")
+    play.add_argument("--amplitude", type=milli, default=5500, metavar="V", help="peak audio voltage, default 5.5 V, up to 6 V")
+    play.add_argument("--transport", choices=("mulaw", "pcm16"), default="mulaw", help="RTT sample encoding, default mulaw")
+    play.add_argument("--preemphasis-us", type=float, default=270.0, help="R/L high-frequency compensation, default 270 us")
+    play.add_argument("--bass-db", type=float, default=12.0, help="300 Hz low-shelf gain, -12 to 18 dB, default 12 dB")
     watch = subs.add_parser("watch", help="stream status until Ctrl+C")
     watch.add_argument("--csv", action="store_true")
     watch.add_argument("--seconds", type=positive, help="stop reading after this duration")
@@ -328,6 +343,20 @@ def commands(parser, shell=False):
 def dispatch(link, args, machine=False):
     action = args.action
     settings = None
+    if action == "play":
+        if __package__:
+            from .audio import play_file
+        else:
+            from audio import play_file
+        result = play_file(link, args)
+        if machine:
+            print(json.dumps(result))
+        else:
+            print(f"played {result['file']} at {result['sample_rate']} Hz, {result['seconds']:.3f} s, "
+                  f"speed={result['speed_rad_s']} rad/s, underruns={result['status']['audio_underruns']}")
+            for warning in result["warnings"]:
+                print(f"warning {warning}", file=sys.stderr)
+        return result
     if action == "watch":
         writer = csv.writer(sys.stdout) if args.csv else None
         if writer:
@@ -426,15 +455,18 @@ def main():
     from pyocd.core.exceptions import Error as PyOcdError
     try:
         probe = select_probe(args.probe) if args.json else args.probe
-        with open_link(probe, args.frequency, args.timeout) as link:
+        frequency = args.frequency if args.frequency is not None else (8000000 if args.action == "play" else None)
+        with open_link(probe, frequency, args.timeout) as link:
             if args.action == "shell":
                 interactive(link)
             else:
-                dispatch(link, args, args.json)
+                outcome = dispatch(link, args, args.json)
+                if outcome is not None:
+                    return int(not outcome.get("ok", True))
         return 0
     except KeyboardInterrupt:
         return 130
-    except (RuntimeError, TimeoutError, OSError, PyOcdError) as error:
+    except (ValueError, RuntimeError, TimeoutError, OSError, PyOcdError) as error:
         if args.json:
             print(json.dumps({"ok": False, "error": str(error)}), file=sys.stderr)
         else:
